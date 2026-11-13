@@ -100,6 +100,17 @@ SPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')
 
 教训：任何 `grep -w <挂载点>` 的判定，只要你自己往该路径下加了挂载点，就会失效。
 
+
+### 兼容层的组织方式（踩了三次坑之后）
+
+最早是把 `command()` / `sha256sum()` / CA 导出 / `http_response` 逐段追加进 `base.sh`，用标记判断是否已存在。三个版本的迭代证明这条路走不通：
+
+1. 标记存在就跳过 ⇒ 升级后旧函数体永远留着（`http_response` 停在空实现，界面「检查更新」永远失败）
+2. 改成"发现旧块就从标记处截断重写" ⇒ `sed '/^# XWT_ARM380_/,$d'` 会把相邻的块一起删掉，CA 和 `sha256sum` 就这样消失，规则更新随之失败
+3. 最终方案：所有 shim 放进 `/koolshare/scripts/xwt_arm380_shims.sh`，`base.sh` 只挂一行 loader，安装时整文件覆盖。改一个函数只动一个文件，互不影响
+
+教训：**给别人的配置追加内容时，不要用"标记 + 追加"做版本管理**，要么独立文件，要么整段替换有自己的边界标记。
+
 ## 7. 没有做的事
 
 - **`/koolshare/bin` 里 hysteria 4.5 MB、anytls 1.7 MB、smartdns 1.3 MB、obfs-local 0.36 MB**

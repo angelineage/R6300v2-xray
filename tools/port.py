@@ -165,51 +165,14 @@ esac''', "device whitelist")
     text = replace_once(text,
         '''\techo_date "清理旧文件"''',
         '''\t# arm380: /bin/sh has no `command` builtin; upstream uses `command -v` 41x.
-\tif ! grep -q 'XWT_ARM380_COMMAND_SHIM' /koolshare/scripts/base.sh 2>/dev/null; then
-\t\tcat >> /koolshare/scripts/base.sh <<'SHIMEOF'
-
-# XWT_ARM380_COMMAND_SHIM: ash on koolshare 380 lacks the command builtin.
-command() {
-\tif [ "$1" = "-v" ]; then
-\t\tshift
-\t\twhich "$@" 2>/dev/null
-\telse
-\t\twhich "$1" >/dev/null 2>&1 || return 127
-\t\t"$@"
-\tfi
-}
-SHIMEOF
-\t\techo_date "arm380: base.sh 已补齐 command -v 兼容函数。"
-\tfi
-\t# 380 also ships md5sum but no sha256sum, so every SHA-256 check in the
-\t# updater failed silently; and its CA store is from 2017, so every HTTPS
-\t# fetch died in the TLS handshake. Both are fixed once, here, for every
-\t# script that sources base.sh.
-\tif ! grep -q 'XWT_ARM380_SHA_SHIM' /koolshare/scripts/base.sh 2>/dev/null; then
-\t\tcat >> /koolshare/scripts/base.sh <<'SHIMEOF2'
-
-# XWT_ARM380_SHA_SHIM: no sha256sum on this firmware; openssl always is present.
-sha256sum() {
-\t_rc=0
-\tfor _f in "$@"; do
-\t\tcase "$_f" in -*) continue ;; esac
-\t\t_h=$(openssl dgst -sha256 "$_f" 2>/dev/null | awk '{print $NF}')
-\t\tif [ -n "$_h" ]; then echo "$_h  $_f"; else _rc=1; fi
-\tdone
-\treturn $_rc
-}
-
-# XWT_ARM380_CA: bundled 2026 bundle, the firmware one expired in practice.
-if [ -f /koolshare/res/cacert.pem ]; then
-\tCURL_CA_BUNDLE=/koolshare/res/cacert.pem
-\texport CURL_CA_BUNDLE
-fi
-SHIMEOF2
-\t\techo_date "arm380: base.sh 已补齐 sha256sum 与 CA 证书环境。"
-\tfi
-\tif ! grep -q 'XWT_ARM380_ALIAS_SHIM' /koolshare/scripts/base.sh 2>/dev/null; then
-\t\tcat /tmp/shadowsocks/scripts/xwt_arm380_alias_shim.sh >> /koolshare/scripts/base.sh
-\t\techo_date "arm380: base.sh 已补齐 alias 兼容函数。"
+\t# 8. Every arm380 compatibility shim lives in ONE file so an upgrade can
+\t#    replace it wholesale. Appending blocks to base.sh meant an old body
+\t#    survived forever, and stripping one block removed its neighbour.
+\tif ! grep -q 'XWT_ARM380_SHIM_LOADER' /koolshare/scripts/base.sh 2>/dev/null; then
+\t\t# older installs appended up to four blocks, all starting with this prefix
+\t\tsed -i '/^# XWT_ARM380_/,$d' /koolshare/scripts/base.sh 2>/dev/null
+\t\tprintf '\n# XWT_ARM380_SHIM_LOADER: arm380 shims, rewritten on every install\n[ -f /koolshare/scripts/xwt_arm380_shims.sh ] && . /koolshare/scripts/xwt_arm380_shims.sh\n' >> /koolshare/scripts/base.sh
+\t\techo_date "arm380: base.sh 已挂载兼容函数。"
 \tfi
 \techo_date "清理旧文件"''',
         "command shim injection")
@@ -705,11 +668,53 @@ API_SHIM = r'''/*
 				},
 				function () { done(complete, { result: "{}" }); });
 		}
+		/* ss_update.sh check answers through http_response. The bridge parks the
+		 * tag in /res/xwt_tmp/xwt_upd.js together with the request id, so a stale
+		 * file from an earlier click can never be mistaken for this answer. */
+		function readUpdateCheck(complete) {
+			var tries = 0, want = String(id);
+			function attempt() {
+				readUtf8("/res/xwt_tmp/xwt_upd.js?_=" + new Date().getTime(), function (txt) {
+					var body = String(txt == null ? "" : txt);
+					var got = /"id"\s*:\s*"([^"]*)"/.exec(body);
+					var val = /"result"\s*:\s*"([^"]*)"/.exec(body);
+					if (got && val && got[1] === want) { done(complete, { result: val[1] }); return; }
+					if (++tries < 22) { setTimeout(attempt, 700); }
+					else { done(complete, { result: "unavailable" }); }
+				}, function () {
+					if (++tries < 22) { setTimeout(attempt, 700); }
+					else { done(complete, { result: "unavailable" }); }
+				});
+			}
+			attempt();
+		}
+		/* ss_update.sh check answers through http_response. The bridge parks the
+		 * tag in /res/xwt_tmp/xwt_upd.js together with the request id, so a stale
+		 * file from an earlier click can never be mistaken for this answer. */
+		function readUpdateCheck(complete) {
+			var tries = 0, want = String(id);
+			function attempt() {
+				readUtf8("/res/xwt_tmp/xwt_upd.js?_=" + new Date().getTime(), function (txt) {
+					var body = String(txt == null ? "" : txt);
+					var got = /"id"\s*:\s*"([^"]*)"/.exec(body);
+					var val = /"result"\s*:\s*"([^"]*)"/.exec(body);
+					if (got && val && got[1] === want) { done(complete, { result: val[1] }); return; }
+					if (++tries < 22) { setTimeout(attempt, 700); }
+					else { done(complete, { result: "unavailable" }); }
+				}, function () {
+					if (++tries < 22) { setTimeout(attempt, 700); }
+					else { done(complete, { result: "unavailable" }); }
+				});
+			}
+			attempt();
+		}
 		function nextGroup() {
 			if (idx >= order.length) {
 				if (String(method) === "ss_log.sh") { pollLogOutput(); }
 				else if (String(method) === "ss_status.sh") { readStatusPayload(complete); }
 				else if (String(method) === "ss_dashboard.sh") { readDashPayload(complete); }
+				else if (String(method) === "ss_update.sh") { readUpdateCheck(complete); }
+				else if (String(method) === "ss_update.sh") { readUpdateCheck(complete); }
 				else { done(complete, { result: id }); }
 				return;
 			}
@@ -838,10 +843,10 @@ if (typeof window.Base64 === "undefined") {
 # 380's ash does not expand aliases in non-interactive scripts, while the
 # upstream defines echo_date / urldecode as aliases. Without function
 # fallbacks, ss_node_subscribe.sh silently gets an EMPTY link list.
-ALIAS_SHIM = r'''# XWT_ARM380_ALIAS_SHIM: 380 ash does not expand aliases in scripts.
+ALIAS_SHIM = r'''# XWT_ARM380_ALIAS_SHIM_V2: 380 ash does not expand aliases in scripts.
 echo_date() { echo "【$(TZ=UTC-8 date -R '+%Y%m%d %X')】: $*"; }
 urldecode() { sed -e 's/+/ /g' -e 's/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g' | xargs -0 printf '%b'; }
-http_response() { :; }
+http_response() { printf '%s' "$1" > /tmp/upload/.xwt_response 2>/dev/null; }
 '''
 
 # 380's httpd has no /_temp/ route, but 19 upstream call sites read the upload
@@ -1291,6 +1296,25 @@ printf '%s' "$METHOD" | grep -Eq '^[A-Za-z0-9_.-]+\.sh$' || exit 1
 SCRIPT="$KSROOT/scripts/$METHOD"
 [ -f "$SCRIPT" ] || exit 1
 
+# The UI sends exactly one param per call, but ss_update.sh and
+# ss_rule_update.sh were written for httpdb, which passed the request id as $1
+# and the action as $2. Without the id they fall through to "exit 2", so the
+# buttons did nothing. Restore that contract here.
+if [ "$METHOD" = "ss_update.sh" ] && [ "$PARAMS" = "check" ]; then
+	# check_release answers through http_response, which now lands in a file.
+	rm -f /tmp/upload/.xwt_response
+	/bin/sh "$SCRIPT" "$REQID" check >/dev/null 2>&1
+	_upd=$(cat /tmp/upload/.xwt_response 2>/dev/null)
+	case "$_upd" in v[0-9]*) ;; *) _upd=unavailable ;; esac
+	printf '{"result":"%s","id":"%s"}' "$_upd" "$REQID" > "$KSROOT/res/xwt_tmp/xwt_upd.js.$$" &&
+		mv -f "$KSROOT/res/xwt_tmp/xwt_upd.js.$$" "$KSROOT/res/xwt_tmp/xwt_upd.js"
+	rm -f /tmp/upload/.xwt_response
+	exit 0
+fi
+case "$METHOD" in
+	ss_update.sh|ss_rule_update.sh) PARAMS="$REQID $PARAMS" ;;
+esac
+
 # A new apply must not close the progress dialog on the PREVIOUS run's
 # terminator: drop the old log the moment the apply is dispatched.
 if [ "$METHOD" = "ss_config.sh" ] && [ "$PARAMS" = "start" ]; then
@@ -1376,6 +1400,48 @@ exit 0
 '''
 
 
+_SHIM_HEAD = r'''#!/bin/sh
+# XWT_ARM380_SHIMS -- every arm380 compatibility shim in one file.
+# base.sh sources this through a single loader line, so an upgrade replaces the
+# whole set instead of appending yet another block.
+
+# 1. ash on koolshare 380 has no `command` builtin (upstream calls it 41x).
+command() {
+	if [ "$1" = "-v" ]; then
+		shift
+		which "$@" 2>/dev/null
+	else
+		which "$1" >/dev/null 2>&1 || return 127
+		"$@"
+	fi
+}
+
+# 2. no sha256sum on this firmware; openssl always is present.
+sha256sum() {
+	_rc=0
+	for _f in "$@"; do
+		case "$_f" in -*) continue ;; esac
+		_h=$(openssl dgst -sha256 "$_f" 2>/dev/null | awk '{print $NF}')
+		if [ -n "$_h" ]; then echo "$_h  $_f"; else _rc=1; fi
+	done
+	return $_rc
+}
+
+# 3. the firmware CA store dates from 2017-09-14; prefer the bundled bundle.
+if [ -f /koolshare/res/cacert.pem ]; then
+	CURL_CA_BUNDLE=/koolshare/res/cacert.pem
+	export CURL_CA_BUNDLE
+fi
+
+# 4. aliases are not expanded inside scripts on this shell, and httpdb's
+#    /_resp/<id> does not exist -- the alias shim carries both.
+'''
+
+# Reuse the alias shim verbatim (its sed/printf escapes are easy to get wrong)
+# minus its own marker line, which only matters when it is appended directly.
+SHIMS = _SHIM_HEAD + ALIAS_SHIM.split("\n", 1)[1]
+
+
 def main():
     if not SRC_UP.is_dir():
         raise SystemExit("upstream source missing: %s" % SRC_UP)
@@ -1430,6 +1496,8 @@ def main():
     # --- new backend bridge + ash alias shim ---
     write_text_lf(SRC / "scripts" / "fss_api_bridge.sh", BRIDGE)
     write_text_lf(SRC / "scripts" / "xwt_arm380_alias_shim.sh", ALIAS_SHIM)
+    write_text_lf(SRC / "scripts" / "xwt_arm380_shims.sh", SHIMS)
+    write_text_lf(SRC / "scripts" / "xwt_arm380_shims.sh", SHIMS)
     write_text_lf(SRC / "scripts" / "xwt_tmp_mirror.sh", TMP_MIRROR)
     write_text_lf(SRC / "scripts" / "xwt_dash_sampler.sh", SAMPLER)
     write_text_lf(SRC / "scripts" / "ss_dashboard.sh", DASH_SHIM)
