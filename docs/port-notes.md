@@ -75,7 +75,32 @@
 3. **jq 静默空输出**：`jq -r --slurpfile n f '...'` 必须配 `-n`，否则 filter 没有输入可跑，
    退出码 0、输出为空，看起来像“配置文件读不到”。
 
-## 6. 没有做的事
+## 6. 更新链路：两个缺失的基础件 + 一个自己挖的坑
+
+380 固件的基础设施比 386 老一截：**没有 `sha256sum`**（只有 `md5sum`），**CA 证书库停在 2017-09-14**。
+两者都不报错，只是静默失败——所以最初看上去像"网络不通"：
+
+- `sha256sum f | awk '{print $1}'` 返回空串，与清单里的值不等 → 判"校验失败"；
+- `curl` 默认校验失败时配 `-f` 直接非零退出 → `fetch` 返回 1 → "下载失败"。
+
+修法：`base.sh` 注入 `sha256sum()`（走 `openssl dgst -sha256`，这台机的 openssl 是 1.0.2n，够用），
+并把包内的 `res/cacert.pem` 通过 `export CURL_CA_BUNDLE` 全局生效。两处都放在被所有脚本 source 的
+`base.sh` 里，一次修完，不用逐个改几十处 `curl` 调用。
+
+第三个坑是我们自己挖的。插件把快照 tmpfs 挂在 `/jffs/.koolshare/res/xwt_tmp`（`/koolshare` 是它的软链），
+而 `install.sh` 用 `df | grep -w "/jffs"` 取剩余空间。`-w` 认为 `/jffs` 后面接 `/` 也算词边界，
+于是**同时匹配两行**，`SPACE_AVAL` 变成 `36328\n4036`，数值比较直接 `bad number`。
+更糟的是这个检查在 `rm -rf /koolshare/ss/*` **之后**，等于把插件删干净了才退出安装。
+
+修法：按挂载点列精确匹配。
+
+```sh
+SPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')
+```
+
+教训：任何 `grep -w <挂载点>` 的判定，只要你自己往该路径下加了挂载点，就会失效。
+
+## 7. 没有做的事
 
 - **`/koolshare/bin` 里 hysteria 4.5 MB、anytls 1.7 MB、smartdns 1.3 MB、obfs-local 0.36 MB**
   当前 vless 链路不用，但脚本都引用着，删了就没法切 hy2/anytls 节点。

@@ -59,7 +59,10 @@ UPSTREAM = pathlib.Path(os.environ.get("XWT_UPSTREAM") or (TMP / "xray-web-tool"
 SRC_UP = UPSTREAM / "src" / "shadowsocks"
 SRC = ROOT / "src" / "shadowsocks"
 DIST = ROOT / "dist"
-VERSION = json.loads((UPSTREAM / "maintenance.json").read_text("utf-8"))["version"]
+# XWT_VERSION overrides the version stamped into the package name and
+# maintenance.json; the in-app updater compares that value against the tag.
+VERSION = (os.environ.get("XWT_VERSION")
+           or json.loads((UPSTREAM / "maintenance.json").read_text("utf-8"))["version"])
 # ks_tar_intall.sh derives the extracted directory name from the first
 # underscore-separated token of the tarball filename -> must be "shadowsocks".
 PACKAGE_NAME = "shadowsocks_arm380_r6300v2_%s.tar.gz" % VERSION
@@ -178,12 +181,48 @@ command() {
 SHIMEOF
 \t\techo_date "arm380: base.sh 已补齐 command -v 兼容函数。"
 \tfi
+\t# 380 also ships md5sum but no sha256sum, so every SHA-256 check in the
+\t# updater failed silently; and its CA store is from 2017, so every HTTPS
+\t# fetch died in the TLS handshake. Both are fixed once, here, for every
+\t# script that sources base.sh.
+\tif ! grep -q 'XWT_ARM380_SHA_SHIM' /koolshare/scripts/base.sh 2>/dev/null; then
+\t\tcat >> /koolshare/scripts/base.sh <<'SHIMEOF2'
+
+# XWT_ARM380_SHA_SHIM: no sha256sum on this firmware; openssl always is present.
+sha256sum() {
+\t_rc=0
+\tfor _f in "$@"; do
+\t\tcase "$_f" in -*) continue ;; esac
+\t\t_h=$(openssl dgst -sha256 "$_f" 2>/dev/null | awk '{print $NF}')
+\t\tif [ -n "$_h" ]; then echo "$_h  $_f"; else _rc=1; fi
+\tdone
+\treturn $_rc
+}
+
+# XWT_ARM380_CA: bundled 2026 bundle, the firmware one expired in practice.
+if [ -f /koolshare/res/cacert.pem ]; then
+\tCURL_CA_BUNDLE=/koolshare/res/cacert.pem
+\texport CURL_CA_BUNDLE
+fi
+SHIMEOF2
+\t\techo_date "arm380: base.sh 已补齐 sha256sum 与 CA 证书环境。"
+\tfi
 \tif ! grep -q 'XWT_ARM380_ALIAS_SHIM' /koolshare/scripts/base.sh 2>/dev/null; then
 \t\tcat /tmp/shadowsocks/scripts/xwt_arm380_alias_shim.sh >> /koolshare/scripts/base.sh
 \t\techo_date "arm380: base.sh 已补齐 alias 兼容函数。"
 \tfi
 \techo_date "清理旧文件"''',
         "command shim injection")
+
+    # The free-space gate looks up /jffs with `df | grep -w "/jffs"`. Our
+    #     tmpfs lives at /jffs/.koolshare/res/xwt_tmp, which contains "/jffs"
+    #     as a word too, so grep returns TWO lines, SPACE_AVAL becomes
+    #     "36328\n4036" and the numeric test aborts with "bad number" right
+    #     after the old files were already deleted. Match the mount column.
+    text = replace_once(text,
+        '''\tSPACE_AVAL=$(df | grep -w "/jffs" | awk '{print $4}')''',
+        '''\tSPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')''',
+        "jffs free space lookup")
 
     # 9. arm380 boot hook. The legacy nat-start called ssconfig.sh with NO
     #    argument, which matches no case branch -> nothing started on reboot.
@@ -1345,9 +1384,35 @@ def main():
     SRC.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(SRC_UP, SRC)
 
+    # --- CA bundle ---------------------------------------------------------
+    # /etc/ssl/certs/ca-certificates.crt on 380.70 is dated 2017-09-14 and no
+    # longer validates raw.githubusercontent.com or api.github.com. base.sh
+    # exports CURL_CA_BUNDLE pointing here once the file exists.
+    ca_src = ROOT / "tools" / "assets" / "cacert.pem"
+    if not ca_src.is_file():
+        raise SystemExit("missing CA bundle: %s" % ca_src)
+    shutil.copyfile(ca_src, SRC / "res" / "cacert.pem")
+
     # --- install.sh ---
     p = SRC / "install.sh"
     write_text_lf(p, patch_install_sh(p.read_text("utf-8")))
+
+    # --- self-update: point at this port's releases ---------------------
+    # Upstream looks for xray_web_tool_arm_lite_ac3100_<v>.tar.gz in the 386
+    # repository, so on 380 the asset lookup could never match.
+    p = SRC / "scripts" / "ss_update.sh"
+    t = p.read_text("utf-8")
+    t = replace_once(t, "REPO=https://api.github.com/repos/angelineage/xray-web-tool",
+                     "REPO=https://api.github.com/repos/angelineage/R6300v2-xray",
+                     "update api repo")
+    t = replace_once(t, 'NAME="xray_web_tool_arm_lite_ac3100_${NEW}.tar.gz"',
+                     'NAME="shadowsocks_arm380_r6300v2_${NEW}.tar.gz"',
+                     "update asset name")
+    if t.count("https://github.com/angelineage/xray-web-tool/releases/download/*") != 2:
+        raise SystemExit("PATCH FAILED [update url prefix]: expected 2 matches")
+    t = t.replace("https://github.com/angelineage/xray-web-tool/releases/download/*",
+                  "https://github.com/angelineage/R6300v2-xray/releases/download/*")
+    write_text_lf(p, t)
 
     # --- new frontend shim first: its content hash versions the <script> tag,
     #     otherwise browsers keep serving a cached copy across builds ---
@@ -1419,6 +1484,8 @@ def main():
                      "to": "R6300V2 / Merlin-Koolshare 380.70_X7.9.1",
                      "api_shim": "res/xwt-arm380-api.js",
                      "status": "experimental - UI data layer needs on-device tuning"}
+    # The updater reads this back to decide "already current" vs "upgrade".
+    maint["version"] = VERSION
     write_text_lf(SRC / "ss" / "maintenance.json",
                   json.dumps(maint, ensure_ascii=False, indent=2) + "\n")
     write_text_lf(SRC / "ss" / "compat_revision", "r6300v2-arm380-" + VERSION + "\n")

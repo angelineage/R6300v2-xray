@@ -9,9 +9,9 @@
 
 | 项目 | 值 |
 |---|---|
-| 版本 | 0.1.8 |
-| 安装包 | `shadowsocks_arm380_r6300v2_0.1.8.tar.gz`（175 文件 / 12.9 MB） |
-| SHA-256 | `fe839a57be12f589dc186a21982542bbbc4c46fbdcb950607f4cf5390e918b3d` |
+| 版本 | 0.1.10 |
+| 安装包 | `shadowsocks_arm380_r6300v2_0.1.10.tar.gz`（176 文件 / 13.0 MB） |
+| SHA-256 | `c159519a4a19c24f14e7deb9d0c13a60a0f589030ebd0eb6dcb0ee53fe5b9bb3` |
 | 实测机型 | R6300V2（380.70_X7.9.1）；其他 arm380 机型未验证 |
 | 许可 | GPL-3.0（与上游一致，二进制原样取自上游发行） |
 
@@ -19,7 +19,7 @@
 
 在 R6300V2 上实测通过：安装/卸载、节点订阅导入、vless + xhttp 出网（302/200 验证）、
 规则与 DNS（chinadns-ng）、开机自启（重启后 xray + chinadns-ng + iptables 链自动恢复）、
-运行状态面板（1 秒刷新）、日志页、节点切换。
+运行状态面板（1 秒刷新）、日志页、节点切换、**规则更新**与**插件自更新**（见下）。
 
 ## 安装
 
@@ -72,6 +72,27 @@ sh /koolshare/scripts/ks_tar_intall.sh
 关键结论：**面板每秒轮询一次 `/_api/`，httpd 就要 fork 一个 shell**，只为拿一份 290 字节的 JSON。
 改成直读 tmpfs 文件、每 30 次才走一次真 RPC 兜底后，`mtdblock3`（squashfs 块线程）从 46% 掉到 2.7%。
 
+## 自动更新
+
+两个通道都在 R6300V2 上实测跑通。
+
+**规则更新**（`scripts/ss_rule_update.sh`）
+
+- 定时：`0 4 * * *`（在界面上改成你想要的小时数即可）
+- 源：`raw.githubusercontent.com/angelineage/xray-web-tool/main/src/shadowsocks/ss/rules`
+- 流程：先拉 `rules.json.js` 清单 → 逐文件比对 SHA-256 → 下载 → 校验 SHA-256 → 校验格式与条数（gfwlist/chnlist 域名数、chnroute 网段数）→ 全量通过才替换，中途失败整批回滚
+- 只替换勾选的项（gfwlist / chnlist / chnroute），替换成功后重启插件生效
+
+**插件自更新**（`scripts/ss_update.sh`）
+
+- 查本仓库 Releases 的 `latest`
+- 资产名固定 `shadowsocks_arm380_r6300v2_<版本>.tar.gz`，下载后校验 `SHA256SUMS.txt`
+- 解包后校验 `maintenance.json`：`version` 必须等于标签值、`target.model` 必须是 `R6300V2`，否则拒绝安装（防止把 386 的包或别的机型的包灌进来）
+- 直连 GitHub 失败时自动改走本机 `socks5 127.0.0.1:23456` 续传重试
+- 升级保留节点、当前节点、排序与订阅：节点存在 dbus 的 `fss_node_*` 里，安装脚本只替换 `/koolshare/ss` 下的程序与规则
+
+380 固件有两个坑让这两条链路本来是死的，已在本仓库修掉：**没有 `sha256sum`**（只有 `md5sum`，改用 `openssl dgst -sha256` 实现），**CA 证书库停在 2017 年**（包里带 `res/cacert.pem`，`base.sh` 导出 `CURL_CA_BUNDLE`）。
+
 ## 实测数据
 
 30 秒窗口，面板开启，同一台 R6300V2：
@@ -109,6 +130,7 @@ XWT_UPSTREAM=/path/to/xray-web-tool python3 tools/port.py
 3. 1.0 软件中心没有 `fss_*` 虚拟表，节点/订阅列表由本地文件导出后镜像，细节行为与上游不完全相同。
 4. **不支持 386**：API 兼容层是针对 1.0 软件中心写的，386 请直接装上游发行版。
 5. “国外连接 / 国内连接”探测默认 90 秒一轮（可改回更短，代价是 CPU）。
+6. 自更新要下 13 MB 包，本机直连 GitHub 常解析超时，日志里会先出现一条 `curl: (6)` 再自动走代理续传，属正常回退；全程约 2 分钟。
 
 ## 目录结构
 
