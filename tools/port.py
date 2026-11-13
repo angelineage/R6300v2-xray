@@ -240,6 +240,18 @@ BOOTEOF
 \tps w | grep -q '[x]wt_dash_sampler.sh' || sh /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1 &
 \techo_date "arm380: 已写入带防重入的开机自启钩子与 /_temp 镜像。"''',
         "boot hook")
+    # arm380: the 1 Hz dashboard sampler is a standalone daemon and an install
+    # replaces its script, so restart it here. Waiting for the next poll to
+    # notice a stale snapshot can take 30 s.
+    text = replace_once(text,
+        '''	# finish''',
+        '''	start-stop-daemon -K -q -p /var/run/xwt_dash_sampler.pid >/dev/null 2>&1
+	for _xwt_p in $(ps w | grep '[x]wt_dash_sampler.sh' | awk '{print $1}'); do kill $_xwt_p 2>/dev/null; done
+	rm -f /tmp/xwt_dash.lock
+	start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid -x /bin/sh -- /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1
+
+	# finish''',
+        "restart dashboard sampler")
     return text
 
 
