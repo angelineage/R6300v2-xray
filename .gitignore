@@ -1,0 +1,10 @@
+# 构建产物（从 Releases 下载）
+dist/
+*.tar.gz
+
+# port.py 从上游检出复制出的工作副本
+src/
+tmp/
+
+__pycache__/
+*.pyc
