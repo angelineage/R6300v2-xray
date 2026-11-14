@@ -22,7 +22,15 @@
 1. **没有 `command` 内建**（上游脚本 42 处 `command -v` 全部失败，安装第一步就退出）。
    修法：向 `/koolshare/scripts/base.sh` 幂等追加 `command()` 函数，覆盖内建语义；
    所有 source base.sh 的脚本一次全好。
-2. **不展开 alias**。`alias echo_date=...` 在脚本里等于没写。修法：改成同名函数。
+2. **会展开 alias —— 而且这比"不展开"危险得多**。`ss_base.sh` 里有
+   `alias echo_date='echo 【..】:'`，而 `base.sh` 在一次运行里会被 source 两次
+   （`ss_conf.sh` → `ss_base.sh` → `base.sh` → 兼容层，然后
+   `ss_node_common.sh` → `base.sh` → 兼容层又来一次）。第二次加载时，兼容层里的
+   `echo_date() {` 被别名改写成 `echo 【..】: () {`，ash 直接报
+   `syntax error: unexpected "("` 并**终止整个脚本**。
+   表现是"点了没反应"，日志里只有一行语法错误。
+   修法：兼容层文件第一行先 `unalias echo_date urldecode http_response command sha256sum`，
+   这样它被 source 多少次都安全。
 3. **脚本注释里不能出现单引号**。`printf "%.0f"  # awk's %d folds` 会提前闭合引号，
    报 `unexpected word (expecting ")")`。这个错不会指向真实行号，非常费时。
 4. **`read` 遇 NUL 截断**。读 `/proc/<pid>/cmdline`（NUL 分隔）只能拿到第一个字段，
@@ -110,6 +118,67 @@ SPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')
 3. 最终方案：所有 shim 放进 `/koolshare/scripts/xwt_arm380_shims.sh`，`base.sh` 只挂一行 loader，安装时整文件覆盖。改一个函数只动一个文件，互不影响
 
 教训：**给别人的配置追加内容时，不要用"标记 + 追加"做版本管理**，要么独立文件，要么整段替换有自己的边界标记。
+
+## 8. 附加功能：导出 / 清空 / 打包 / 恢复
+
+面板【附加功能】里的四个按钮在 380 上原本全部无效（点下去毫无反应），
+根因有两个，都跟 380 的 httpd 有关。
+
+### 8.1 共同的死点：兼容层被 source 两次
+
+见上面第 2 条。`ss_conf.sh` 是这四个功能的唯一入口（导出=参数 12、清空=3、
+打包=2、恢复=4），它在第二次加载兼容层时就被 ash 的语法错误打死，
+所以四个功能一起失灵。兼容层加一行 `unalias` 之后全部恢复。
+
+### 8.2 httpd 只放行 `.js` / `.xml`
+
+实测（未登录态，`.js` 返回登录页说明路由通过，`.json` 直接 404）：
+
+| 路径 | 结果 |
+|---|---|
+| `/_root/files/x.js` | 200（放行）|
+| `/_root/files/x.xml` | 200（放行）|
+| `/_root/files/x.json` | **404** |
+| `/_root/files/x.sh` | **404** |
+| `/_root/files/x.tar.gz` | **404** |
+
+扩展名白名单在**鉴权之前**生效，所以"文件确实生成了"也没用，浏览器根本取不到。
+上游把导出结果放在 `_root/files/ssconf_backup_v2.json`，在 380 上必然 404。
+
+修法：`ss_conf.sh` 生成文件后额外挂一个**硬链接** `原名.js`，
+ASP 的下载 URL 指向 `.js` 那一份。浏览器用 blob 下载并以 `a[download]` 指定的名字
+保存，用户拿到的仍是 `.json` / `.sh` / `.tar.gz`。
+用硬链接而不是复制：打包出来 13 MB，而 `/tmp` 是内存。
+
+### 8.3 没有 `/_upload`：恢复配置要自己传文件
+
+上游的"恢复配置"用 httpdb 的 `POST /_upload` 把备份文件推进 `/tmp/upload`。
+380 上 `/_upload` 与 `/upload` 都是 404，只有固件自己的 `/upload.cgi`（存 nvram 用）。
+
+修法：前端改成用 FileReader 读文件 → base64 → **每片一个独立 dbus 键**
+（`ss_backup_c0`、`ss_backup_c1`…，每片 3000 字符）分片 POST 上去，
+最后发一次 commit；`xwt_backup_upload.sh` 按序号拼接、base64 解码，
+写回 `/tmp/upload/ssconf_backup.json`，然后 `ss_conf.sh 4` 照常恢复。
+
+每片用独立键而不是同一个键追加，是为了避开竞态：
+慢请求不会覆盖还没被取走的上一片。dbus 单值上限实测约 16 KB（`dbus get` 读回会截断，
+`dbus export` 才是完整的），3000 字符/片远在安全范围内。
+
+## 9. 采样器的"存活检查"不能只看进程名
+
+采样器有一个常驻主进程和一个 `--traffic-daemon` 采集子进程。
+早先的存活检查是 `ps w | grep -q '[x]wt_dash_sampler.sh'`，
+采集子进程的命令行同样包含这个串 —— 于是主进程死掉后，
+采集进程冒充"采样器还活着"，桥接认为一切正常，永远不重启主进程，
+面板就停在最后一份快照上（实测落后 33 分钟）。
+
+修法两处：
+- 存活检查收紧为 `[x]wt_dash_sampler.sh$`（只有主进程命令行以路径结尾）；
+- 采集进程每 20 轮检查一次主进程是否还在，不在就退出（它本来是子进程，
+  主进程没了它会被 init 收养并继续跑，这正是问题所在）。
+
+实测：杀掉主进程 → 采集进程 ~20 秒后自行退出 → 桥接下一次轮询发现快照过期 →
+自动拉起主进程与采集进程 → 快照恢复 1 秒新鲜。
 
 ## 7. 没有做的事
 

@@ -217,7 +217,7 @@ if ! ps w | grep -q '[x]wt_tmp_mirror.sh'; then
 fi
 # XWT_ARM380_DASH: one resident 1 Hz sampler owns the status snapshot. The
 # poll path must not fork jq/curl per request -- that saturated mtdblock3.
-if ! ps w | grep -q '[x]wt_dash_sampler.sh'; then
+if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 \tif [ -x /usr/sbin/start-stop-daemon ]; then
 \t\tstart-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid -x /bin/sh -- /koolshare/scripts/xwt_dash_sampler.sh
 \telse
@@ -237,7 +237,7 @@ BOOTEOF
 \tfi
 \tps w | grep -q '[x]wt_tmp_mirror.sh' || sh /koolshare/scripts/xwt_tmp_mirror.sh >/dev/null 2>&1 &
 \tchmod 755 /koolshare/scripts/xwt_*.sh >/dev/null 2>&1
-\tps w | grep -q '[x]wt_dash_sampler.sh' || sh /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1 &
+\tps w | grep -q '[x]wt_dash_sampler.sh$' || sh /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1 &
 \techo_date "arm380: 已写入带防重入的开机自启钩子与 /_temp 镜像。"''',
         "boot hook")
     # arm380: the 1 Hz dashboard sampler is a standalone daemon and an install
@@ -269,6 +269,59 @@ ICON_CSS = '''<style type="text/css">
 #log_content1{background:#1b1f22 !important;color:#dfe6e9 !important;border:1px solid #4b5563 !important;font:12px/1.5 Consolas,Menlo,monospace !important;}
 </style>
 '''
+
+
+
+def patch_ss_conf(text):
+    """arm380: httpd only serves .js/.xml out of any directory -- every other
+    extension is a 404 *before* authentication, so "_root/files/x.json" never
+    reaches the browser even though the file exists. Publish each download a
+    second time under a *.js hardlink (the browser saves it under the real name
+    through a[download]) and point the UI at that URL."""
+    helper = '''LOG_FILE=/tmp/upload/ss_log.txt
+
+# arm380: httpd serves only .js/.xml from any directory; everything else is a
+# 404 before authentication. Every download is therefore published twice: the
+# real file keeps its extension for the restore path, and a hardlink named
+# *.js is what the browser actually fetches. Hardlink rather than copy -- the
+# package is 13 MB and /tmp lives in RAM.
+publish_download_alias(){
+	[ -n "$1" ] || return 0
+	[ -f "$1" ] || return 0
+	rm -f "$1.js"
+	ln "$1" "$1.js" 2>/dev/null || cp -f "$1" "$1.js"
+}'''
+    text = replace_once(text, "LOG_FILE=/tmp/upload/ss_log.txt", helper,
+                        "ss_conf publish helper")
+
+    old = '''	rm -f "${target_file}" "${tmp_file}"
+	if "$@" "${tmp_file}"; then
+		mv -f "${tmp_file}" "${target_file}"
+'''
+    new = '''	rm -f "${target_file}" "${tmp_file}" "${target_file}.js"
+	if "$@" "${tmp_file}"; then
+		mv -f "${tmp_file}" "${target_file}"
+		publish_download_alias "${target_file}"
+'''
+    text = replace_once(text, old, new, "ss_conf alias on export")
+
+    old = '''    mv /tmp/files/shadowsocks.tar.gz.part /tmp/files/shadowsocks.tar.gz
+    echo_date "插件打包完成，准备下载。"'''
+    new = '''    mv /tmp/files/shadowsocks.tar.gz.part /tmp/files/shadowsocks.tar.gz
+    publish_download_alias /tmp/files/shadowsocks.tar.gz
+    echo_date "插件打包完成，准备下载。"'''
+    text = replace_once(text, old, new, "ss_conf alias on package")
+
+    old = '''    rm -f /tmp/files/shadowsocks.tar.gz
+    echo_date "开始打包当前插件..."'''
+    new = '''    rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js
+    echo_date "开始打包当前插件..."'''
+    text = replace_once(text, old, new, "ss_conf package stale cleanup")
+
+    old = '''    case "$act" in 1) rm -f /tmp/files/ssconf_backup.sh ;; 12) rm -f /tmp/files/ssconf_backup_v2.json ;; 2) rm -f /tmp/files/shadowsocks.tar.gz ;; esac'''
+    new = '''    case "$act" in 1) rm -f /tmp/files/ssconf_backup.sh /tmp/files/ssconf_backup.sh.js ;; 12) rm -f /tmp/files/ssconf_backup_v2.json /tmp/files/ssconf_backup_v2.json.js ;; 2) rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js ;; esac'''
+    text = replace_once(text, old, new, "ss_conf stale cleanup")
+    return text
 
 
 def patch_dashboard_js(text):
@@ -422,6 +475,36 @@ def patch_asp(text, shim_ver):
         '''isActive: function() { return E("tablet_10").style.display !== "none" && !document.hidden; },''',
         '''isActive: function() { return E("tablet_10").style.display !== "none"; },''',
         "log viewer isActive")
+
+    # 380 httpd has no /_upload route (httpdb's upload endpoint): the restore
+    # button cannot push the backup file into /tmp/upload. Replace the uploader
+    # with a chunked /_api/ upload; xwt_backup_upload.sh reassembles it.
+    try:
+        _up_i = text.index("function upload_ss_backup() {")
+        _up_j = text.index(chr(10) + "}" + chr(10), _up_i) + 3
+        _up_old = text[_up_i:_up_j]
+        if "/_upload" not in _up_old:
+            raise ValueError("upload_ss_backup no longer posts to /_upload")
+        text = text[:_up_i] + NEW_UPLOAD_JS + text[_up_j:]
+    except ValueError as exc:
+        raise SystemExit("PATCH FAILED [upload_ss_backup]: %s" % exc)
+
+    # 380 httpd serves ONLY .js/.xml out of any directory; *.json / *.sh /
+    # *.tar.gz are a 404 before authentication. ss_conf.sh republishes every
+    # export under a *.js hardlink, so the download URL carries that name while
+    # a[download] still saves the real filename.
+    text = replace_once(text,
+        '''url: "_root/files/shadowsocks.tar.gz"''',
+        '''url: "_root/files/shadowsocks.tar.gz.js"''',
+        "export url: package")
+    text = replace_once(text,
+        '''url: "_root/files/ssconf_backup.sh"''',
+        '''url: "_root/files/ssconf_backup.sh.js"''',
+        "export url: legacy sh")
+    text = replace_once(text,
+        '''url: "_root/files/ssconf_backup_v2.json"''',
+        '''url: "_root/files/ssconf_backup_v2.json.js"''',
+        "export url: json")
     # cosmetic: the upstream hardcodes the reviewed model in two page titles.
     text = text.replace('"RT-AC3100 Xray Web Tool"', '"R6300V2 Xray Web Tool"')
     # 380 ships /res/Softerware_center.css under a different name; our package
@@ -700,32 +783,11 @@ API_SHIM = r'''/*
 			}
 			attempt();
 		}
-		/* ss_update.sh check answers through http_response. The bridge parks the
-		 * tag in /res/xwt_tmp/xwt_upd.js together with the request id, so a stale
-		 * file from an earlier click can never be mistaken for this answer. */
-		function readUpdateCheck(complete) {
-			var tries = 0, want = String(id);
-			function attempt() {
-				readUtf8("/res/xwt_tmp/xwt_upd.js?_=" + new Date().getTime(), function (txt) {
-					var body = String(txt == null ? "" : txt);
-					var got = /"id"\s*:\s*"([^"]*)"/.exec(body);
-					var val = /"result"\s*:\s*"([^"]*)"/.exec(body);
-					if (got && val && got[1] === want) { done(complete, { result: val[1] }); return; }
-					if (++tries < 22) { setTimeout(attempt, 700); }
-					else { done(complete, { result: "unavailable" }); }
-				}, function () {
-					if (++tries < 22) { setTimeout(attempt, 700); }
-					else { done(complete, { result: "unavailable" }); }
-				});
-			}
-			attempt();
-		}
 		function nextGroup() {
 			if (idx >= order.length) {
 				if (String(method) === "ss_log.sh") { pollLogOutput(); }
 				else if (String(method) === "ss_status.sh") { readStatusPayload(complete); }
 				else if (String(method) === "ss_dashboard.sh") { readDashPayload(complete); }
-				else if (String(method) === "ss_update.sh") { readUpdateCheck(complete); }
 				else if (String(method) === "ss_update.sh") { readUpdateCheck(complete); }
 				else { done(complete, { result: id }); }
 				return;
@@ -980,8 +1042,18 @@ collect_traffic() {
 if [ "$TRAFFIC_DAEMON" = 1 ]; then
 	exec 8>/tmp/xwt_dash_traffic.lock
 	flock -n 8 || exit 0
+	_td_tick=0
 	while :; do
 		collect_traffic >/dev/null 2>&1
+		# The collector is a child of the sampler. If the sampler dies the
+		# collector is reparented to init and keeps running -- and then every
+		# "ps | grep xwt_dash_sampler.sh" liveness check sees a live process
+		# and never restarts the real sampler, so the panel freezes on a stale
+		# snapshot. Exit instead and let whoever notices restart the pair.
+		_td_tick=$(( (_td_tick + 1) % 20 ))
+		if [ "$_td_tick" = 0 ]; then
+			ps w | grep -q '[x]wt_dash_sampler.sh$' || exit 0
+		fi
 		# One round already costs 0.5-1.4 s inside Xray's expvar handler, so a
 		# longer nap only trims the wasted wake-ups: the rate stays exact
 		# because the UI differences the stamped samples, not the poll count.
@@ -1257,7 +1329,7 @@ esac
 if [ "$fresh" = 0 ]; then
 	# Cold cache: one synchronous sample, then make sure the daemon survives.
 	snap=$(sh "$KS/scripts/xwt_dash_sampler.sh" --once 2>/dev/null)
-	if ! ps w | grep -q '[x]wt_dash_sampler.sh'; then
+	if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 		sh "$KS/scripts/xwt_dash_sampler.sh" >/dev/null 2>&1 &
 	fi
 fi
@@ -1391,7 +1463,7 @@ if [ "$METHOD" = "ss_dashboard.sh" ]; then
 	read -r _nowf _idle < /proc/uptime
 	_dash_age=$(( ${_nowf%%.*} - _dash_up ))
 	if [ "$_dash_age" -lt 0 ] || [ "$_dash_age" -gt 5 ]; then
-		if ! ps w | grep -q '[x]wt_dash_sampler.sh'; then
+		if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 			if [ -x /usr/sbin/start-stop-daemon ]; then
 				start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid \
 					-x /bin/sh -- "$KSROOT/scripts/xwt_dash_sampler.sh" 2>/dev/null
@@ -1400,6 +1472,24 @@ if [ "$METHOD" = "ss_dashboard.sh" ]; then
 			fi
 		fi
 	fi
+	exit 0
+fi
+
+# xwt_backup_upload.sh: 380 httpd has no /_upload route, so the page uploads
+# a backup file as base64 chunks and this script reassembles it. Run it in the
+# foreground -- the chunk order matters and a background run could interleave
+# with the next request.
+if [ "$METHOD" = "xwt_backup_upload.sh" ]; then
+	/bin/sh "$SCRIPT" $PARAMS >/dev/null 2>&1
+	exit 0
+fi
+
+# xwt_backup_upload.sh: 380 httpd has no /_upload route, so the page uploads
+# a backup file as base64 chunks and this script reassembles it. Run it in the
+# foreground -- the chunk order matters and a background run could interleave
+# with the next request.
+if [ "$METHOD" = "xwt_backup_upload.sh" ]; then
+	/bin/sh "$SCRIPT" $PARAMS >/dev/null 2>&1
 	exit 0
 fi
 
@@ -1416,6 +1506,16 @@ _SHIM_HEAD = r'''#!/bin/sh
 # XWT_ARM380_SHIMS -- every arm380 compatibility shim in one file.
 # base.sh sources this through a single loader line, so an upgrade replaces the
 # whole set instead of appending yet another block.
+
+# XWT_SHIMS_ALIAS_RESET: this ash DOES expand aliases inside scripts, and
+# ss_base.sh carries `alias echo_date=...`. base.sh gets sourced more than once
+# per run (ss_conf.sh -> ss_base.sh -> base.sh -> shims, then
+# ss_node_common.sh -> base.sh -> shims again), so on the SECOND load the line
+# `echo_date() {` was rewritten by the alias into `echo 【..】: () {` and ash
+# aborted the whole script with 'syntax error: unexpected "("'. That silently
+# killed every ss_conf.sh action (export / clear / package). Dropping the
+# aliases first makes this file safe to source any number of times.
+unalias echo_date urldecode http_response command sha256sum 2>/dev/null
 
 # 1. ash on koolshare 380 has no `command` builtin (upstream calls it 41x).
 command() {
@@ -1445,13 +1545,210 @@ if [ -f /koolshare/res/cacert.pem ]; then
 	export CURL_CA_BUNDLE
 fi
 
-# 4. aliases are not expanded inside scripts on this shell, and httpdb's
-#    /_resp/<id> does not exist -- the alias shim carries both.
+# 4. httpdb's /_resp/<id> does not exist on 380 -- park the payload in a file.
+#    (echo_date / urldecode come from the alias shim appended below.)
 '''
 
 # Reuse the alias shim verbatim (its sed/printf escapes are easy to get wrong)
 # minus its own marker line, which only matters when it is appended directly.
 SHIMS = _SHIM_HEAD + ALIAS_SHIM.split("\n", 1)[1]
+
+
+
+BACKUP_UPLOAD = r"""#!/bin/sh
+# arm380: 380 httpd has no /_upload endpoint -- httpdb's upload route does not
+# exist here, so the page cannot push a backup file into /tmp/upload the way
+# upstream expects. The page therefore sends the file as base64 chunks through
+# the normal /_api/ path, and every chunk lands in its OWN dbus key
+# (ss_backup_c0, ss_backup_c1, ...) so a slow request can never overwrite a
+# chunk that has not been picked up yet. This script concatenates the parts in
+# order, decodes them and drops the result where ss_conf.sh looks for it.
+. /koolshare/scripts/base.sh
+
+MODE="$1"
+NAME="$2"
+
+case "${MODE}" in
+	commit) ;;
+	*) exit 1 ;;
+esac
+case "${NAME}" in
+	ssconf_backup.json|ssconf_backup.sh) ;;
+	*) exit 1 ;;
+esac
+
+TOTAL=$(dbus get ss_backup_total 2>/dev/null)
+case "${TOTAL}" in
+	''|*[!0-9]*) exit 1 ;;
+esac
+[ "${TOTAL}" -gt 0 ] || exit 1
+
+B64=/tmp/xwt_backup.b64
+: > "${B64}"
+i=0
+while [ "${i}" -lt "${TOTAL}" ]; do
+	part=$(dbus get "ss_backup_c${i}" 2>/dev/null)
+	if [ -z "${part}" ]; then
+		rm -f "${B64}"
+		exit 1
+	fi
+	printf '%s' "${part}" >> "${B64}"
+	dbus remove "ss_backup_c${i}" >/dev/null 2>&1
+	i=$((i + 1))
+done
+dbus remove ss_backup_total >/dev/null 2>&1
+
+mkdir -p /tmp/upload
+if /koolshare/bin/base64 -d "${B64}" > "/tmp/upload/${NAME}" 2>/dev/null; then
+	rm -f "${B64}"
+	echo "backup uploaded: ${NAME} $(wc -c < "/tmp/upload/${NAME}") bytes"
+	exit 0
+fi
+rm -f "${B64}" "/tmp/upload/${NAME}"
+exit 1
+"""
+
+
+
+
+
+
+NEW_UPLOAD_JS = r"""function upload_ss_backup() {
+	db_ss["ss_basic_action"] = "9";
+	var input = $('#ss_file')[0];
+	var file = (input && input.files) ? input.files[0] : null;
+	if (!file) {
+		alert('请先选择备份文件。');
+		return false;
+	}
+	var parts = String(file.name || '').split('.');
+	var filelast = (parts[parts.length - 1] || '').toLowerCase();
+	if (filelast != "sh" && filelast != "json") {
+		alert('备份文件格式不正确！');
+		return false;
+	}
+	E('ss_file_info').style.display = "none";
+	var target = (filelast == 'sh') ? 'ssconf_backup.sh' : 'ssconf_backup.json';
+	/* arm380: this httpd has no /_upload route, so the file is uploaded as
+	 * base64 chunks through the normal /_api/ path. Every chunk goes into its
+	 * own dbus key, so a slow request can never overwrite another chunk. */
+	var reader = new FileReader();
+	reader.onload = function (evt) {
+		var raw = String(evt.target.result || '');
+		var cut = raw.indexOf(',');
+		var b64 = (cut >= 0) ? raw.slice(cut + 1) : raw;
+		var CHUNK = 3000;
+		var total = Math.max(1, Math.ceil(b64.length / CHUNK));
+		var idx = 0;
+		function sendChunk() {
+			if (idx >= total) { return commitUpload(); }
+			var field = {};
+			field['ss_backup_c' + idx] = b64.substr(idx * CHUNK, CHUNK);
+			var id = parseInt(Math.random() * 100000000);
+			$.ajax({
+				type: 'POST',
+				url: '/_api/',
+				cache: false,
+				data: JSON.stringify({id: id, method: 'dummy_script.sh', params: [], fields: field}),
+				dataType: 'json',
+				success: function () { idx++; sendChunk(); },
+				error: function () { alert('备份文件上传失败，请重试。'); }
+			});
+		}
+		function commitUpload() {
+			var id = parseInt(Math.random() * 100000000);
+			$.ajax({
+				type: 'POST',
+				url: '/_api/',
+				cache: false,
+				data: JSON.stringify({id: id, method: 'xwt_backup_upload.sh',
+					params: ['commit', target], fields: {ss_backup_total: String(total)}}),
+				dataType: 'json',
+				success: function (response) {
+					if (response && String(response.result) == String(id)) {
+						E('ss_file_info').style.display = "block";
+						restore_ss_conf();
+					} else {
+						alert('备份文件上传失败，请重试。');
+					}
+				},
+				error: function () { alert('备份文件上传失败，请重试。'); }
+			});
+		}
+		sendChunk();
+	};
+	reader.readAsDataURL(file);
+	return false;
+}"""
+
+
+NEW_UPLOAD_JS = r"""function upload_ss_backup() {
+	db_ss["ss_basic_action"] = "9";
+	var input = $('#ss_file')[0];
+	var file = (input && input.files) ? input.files[0] : null;
+	if (!file) {
+		alert('请先选择备份文件。');
+		return false;
+	}
+	var parts = String(file.name || '').split('.');
+	var filelast = (parts[parts.length - 1] || '').toLowerCase();
+	if (filelast != "sh" && filelast != "json") {
+		alert('备份文件格式不正确！');
+		return false;
+	}
+	E('ss_file_info').style.display = "none";
+	var target = (filelast == 'sh') ? 'ssconf_backup.sh' : 'ssconf_backup.json';
+	/* arm380: this httpd has no /_upload route, so the file is uploaded as
+	 * base64 chunks through the normal /_api/ path. Every chunk goes into its
+	 * own dbus key, so a slow request can never overwrite another chunk. */
+	var reader = new FileReader();
+	reader.onload = function (evt) {
+		var raw = String(evt.target.result || '');
+		var cut = raw.indexOf(',');
+		var b64 = (cut >= 0) ? raw.slice(cut + 1) : raw;
+		var CHUNK = 3000;
+		var total = Math.max(1, Math.ceil(b64.length / CHUNK));
+		var idx = 0;
+		function sendChunk() {
+			if (idx >= total) { return commitUpload(); }
+			var field = {};
+			field['ss_backup_c' + idx] = b64.substr(idx * CHUNK, CHUNK);
+			var id = parseInt(Math.random() * 100000000);
+			$.ajax({
+				type: 'POST',
+				url: '/_api/',
+				cache: false,
+				data: JSON.stringify({id: id, method: 'dummy_script.sh', params: [], fields: field}),
+				dataType: 'json',
+				success: function () { idx++; sendChunk(); },
+				error: function () { alert('备份文件上传失败，请重试。'); }
+			});
+		}
+		function commitUpload() {
+			var id = parseInt(Math.random() * 100000000);
+			$.ajax({
+				type: 'POST',
+				url: '/_api/',
+				cache: false,
+				data: JSON.stringify({id: id, method: 'xwt_backup_upload.sh',
+					params: ['commit', target], fields: {ss_backup_total: String(total)}}),
+				dataType: 'json',
+				success: function (response) {
+					if (response && String(response.result) == String(id)) {
+						E('ss_file_info').style.display = "block";
+						restore_ss_conf();
+					} else {
+						alert('备份文件上传失败，请重试。');
+					}
+				},
+				error: function () { alert('备份文件上传失败，请重试。'); }
+			});
+		}
+		sendChunk();
+	};
+	reader.readAsDataURL(file);
+	return false;
+}"""
 
 
 def main():
@@ -1509,10 +1806,17 @@ def main():
     write_text_lf(SRC / "scripts" / "fss_api_bridge.sh", BRIDGE)
     write_text_lf(SRC / "scripts" / "xwt_arm380_alias_shim.sh", ALIAS_SHIM)
     write_text_lf(SRC / "scripts" / "xwt_arm380_shims.sh", SHIMS)
-    write_text_lf(SRC / "scripts" / "xwt_arm380_shims.sh", SHIMS)
     write_text_lf(SRC / "scripts" / "xwt_tmp_mirror.sh", TMP_MIRROR)
     write_text_lf(SRC / "scripts" / "xwt_dash_sampler.sh", SAMPLER)
     write_text_lf(SRC / "scripts" / "ss_dashboard.sh", DASH_SHIM)
+    write_text_lf(SRC / "scripts" / "xwt_backup_upload.sh", BACKUP_UPLOAD)
+
+    # --- ss_conf.sh: export / clear / package -----------------------------
+    # Two 380 facts break it: (a) the shims file is sourced twice and the
+    # echo_date alias aborts the run, (b) httpd refuses *.json/*.sh/*.tar.gz,
+    # so each export needs a *.js twin to be downloadable.
+    p = SRC / "scripts" / "ss_conf.sh"
+    write_text_lf(p, patch_ss_conf(p.read_text("utf-8")))
 
     # --- model strings: online update must NOT pull the upstream 386 package
     #     onto this port (its target.model is RT-AC3100, so requiring R6300V2
