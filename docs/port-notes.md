@@ -130,25 +130,40 @@ SPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')
 打包=2、恢复=4），它在第二次加载兼容层时就被 ash 的语法错误打死，
 所以四个功能一起失灵。兼容层加一行 `unalias` 之后全部恢复。
 
-### 8.2 httpd 只放行 `.js` / `.xml`
+### 8.2 下载链路：扩展名、路径前缀、二进制截断，三层坑
 
-实测（未登录态，`.js` 返回登录页说明路由通过，`.json` 直接 404）：
+只修扩展名是不够的。带**有效登录会话**重新实测（早先那张表是未登录态，
+`.js` 的 200 其实是登录页而不是文件）：
 
 | 路径 | 结果 |
 |---|---|
-| `/_root/files/x.js` | 200（放行）|
-| `/_root/files/x.xml` | 200（放行）|
-| `/_root/files/x.json` | **404** |
-| `/_root/files/x.sh` | **404** |
-| `/_root/files/x.tar.gz` | **404** |
+| `/_root/files/ssconf_backup_v2.json.js` | **404**（386 专用前缀，380 根本没有） |
+| `/files/ssconf_backup_v2.json.js` | **404** |
+| `/Module_files/ssconf_backup_v2.json.js` | **200**，与源文件 MD5 完全一致 |
+| `/Module_files/ssconf_backup_v2.json` | **404**（扩展名白名单） |
+| `/Module_files/<不存在的文件>.js` | **200 但 0 字节** |
 
-扩展名白名单在**鉴权之前**生效，所以"文件确实生成了"也没用，浏览器根本取不到。
-上游把导出结果放在 `_root/files/ssconf_backup_v2.json`，在 380 上必然 404。
+380 的 httpd 把 `/Module_<name>` 映射到 `/koolshare/webs/<name>`（前缀保留）。
+`install.sh` 与开机钩子 `nat-start` 都建 `/koolshare/webs/Module_files -> /tmp/files`；
+四个日志下载函数会 `rm -rf /tmp/files`，所以 `publish_download_alias()` 里再兜底重建一次。
 
-修法：`ss_conf.sh` 生成文件后额外挂一个**硬链接** `原名.js`，
-ASP 的下载 URL 指向 `.js` 那一份。浏览器用 blob 下载并以 `a[download]` 指定的名字
-保存，用户拿到的仍是 `.json` / `.sh` / `.tar.gz`。
-用硬链接而不是复制：打包出来 13 MB，而 `/tmp` 是内存。
+**第一层 · 扩展名**：白名单在鉴权之前生效，只放行 `.js` / `.xml`。
+`ss_conf.sh` 生成文件后挂一个**硬链接** `原名.js`（13 MB 包在内存里，不复制），
+浏览器用 blob 下载、`a[download]` 存成原名。
+
+**第二层 · 路径**：上游所有 `_root/files/...` URL 全部改成 `/Module_files/...js`，
+含三个导出和五个日志/状态下载。漏掉这一层，后端文件生成得再正确，前端轮询
+60 次全是 404，最后报「导出文件准备失败，请重试」——这正是"导出配置依然不可用"的根因。
+
+**第三层 · 二进制截断**：httpd 遇到二进制内容会提前停止发送。同一个 13 MB
+`shadowsocks.tar.gz.js`，改成 `.js` 或 `.xml` 都稳定只发 **43100 字节**；
+而 17 MB 纯 ASCII 文本能完整传完，与大小、扩展名、tmpfs/JFFS、单个特殊字节都无关。
+打包插件因此由 `openssl base64 -A` 生成**单行纯文本** `.b64.js`（约 17.4 MB），
+前端 `atob` 解码成 `Uint8Array` 再存回 `.tar.gz`，往返 MD5 实测一致。
+
+另外 `/Module_*` 下不存在的文件也返回 200 空响应，所以 `poll_route_file_ready()`
+不能只看 status，必须校验 body 非空；探测结果按 URL 缓存给 `download_blob_file()`
+复用，17 MB 只下一次。
 
 ### 8.3 没有 `/_upload`：恢复配置要自己传文件
 

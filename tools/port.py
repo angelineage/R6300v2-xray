@@ -192,6 +192,11 @@ esac''', "device whitelist")
     text = replace_once(text,
         '''\tcp -rf /tmp/shadowsocks/webs/* /koolshare/webs/''',
         '''\tcp -rf /tmp/shadowsocks/webs/* /koolshare/webs/
+\t# arm380: the 386 "_root/files/..." route does not exist here. httpd maps
+\t# /Module_<name> to /koolshare/webs/<name>, so expose /tmp/files under that
+\t# name; every export / log download is fetched as /Module_files/<file>.js.
+\tmkdir -p /tmp/files
+\tln -sfn /tmp/files /koolshare/webs/Module_files
 \t# arm380: legacy nat-start called ssconfig.sh without "start" -> no autostart.
 \t# ssconfig.sh also restarts dnsmasq/iptables, which re-triggers nat-start,
 \t# so a bare call causes a start-storm. Always write the guarded version.
@@ -200,6 +205,10 @@ esac''', "device whitelist")
 #!/bin/sh
 [ -x /usr/bin/onnatstart.sh ] && /usr/bin/onnatstart.sh
 mkdir -p /tmp/upload /koolshare/res/xwt_tmp
+# XWT_ARM380_DOWNLOADS: /tmp is RAM, but the /koolshare/webs symlink is JFFS
+# and survives the wipe; recreate both ends on every boot.
+mkdir -p /tmp/files
+ln -sfn /tmp/files /koolshare/webs/Module_files
 # XWT_ARM380_TMPFS: /res is JFFS. Rewriting the status/dashboard mirrors there
 # every second kept the flash in D-state (load 8+ on this 2-core box), so the
 # volatile files live on tmpfs. Falls back to plain JFFS if mount is refused.
@@ -273,11 +282,16 @@ ICON_CSS = '''<style type="text/css">
 
 
 def patch_ss_conf(text):
-    """arm380: httpd only serves .js/.xml out of any directory -- every other
-    extension is a 404 *before* authentication, so "_root/files/x.json" never
-    reaches the browser even though the file exists. Publish each download a
-    second time under a *.js hardlink (the browser saves it under the real name
-    through a[download]) and point the UI at that URL."""
+    """arm380: httpd only serves .js/.xml out of any directory; every other
+    extension is a 404 *before* authentication. On top of that the 386
+    "_root/files/..." URL does not exist on 380 (the working route is
+    /Module_files/<file>.js), and httpd truncates a binary .js response at the
+    first non-text bytes (13 MB package -> 43100 bytes, for .js AND .xml),
+    while 17 MB of plain ASCII goes through intact.
+
+    So: publish a *.js twin for every text download, ship the binary package
+    as single-line base64, and keep the /Module_files symlink alive.
+    """
     helper = '''LOG_FILE=/tmp/upload/ss_log.txt
 
 # arm380: httpd serves only .js/.xml from any directory; everything else is a
@@ -288,8 +302,23 @@ def patch_ss_conf(text):
 publish_download_alias(){
 	[ -n "$1" ] || return 0
 	[ -f "$1" ] || return 0
-	rm -f "$1.js"
+	# 386's "_root/files/..." is a 404 on 380; httpd maps /Module_<name> to
+	# /koolshare/webs/<name>. Keep that symlink alive even after a /tmp wipe.
+	[ -L /koolshare/webs/Module_files ] || ln -sfn /tmp/files /koolshare/webs/Module_files 2>/dev/null
+	rm -f "$1.js" "$1.b64.js"
 	ln "$1" "$1.js" 2>/dev/null || cp -f "$1" "$1.js"
+}
+# arm380 httpd stops sending a binary .js at the first non-text bytes: the
+# 13 MB package was reproducibly cut to 43100 bytes for BOTH .js and .xml,
+# while 17 MB of plain ASCII went through intact. Ship the package as
+# single-line base64; the UI decodes it back into the .tar.gz blob.
+publish_package_download(){
+	publish_download_alias /tmp/files/shadowsocks.tar.gz
+	rm -f /tmp/files/shadowsocks.tar.gz.b64.js
+	openssl base64 -A -in /tmp/files/shadowsocks.tar.gz -out /tmp/files/shadowsocks.tar.gz.b64.js 2>/dev/null
+	if [ ! -s /tmp/files/shadowsocks.tar.gz.b64.js ]; then
+		cp -f /tmp/files/shadowsocks.tar.gz.js /tmp/files/shadowsocks.tar.gz.b64.js
+	fi
 }'''
     text = replace_once(text, "LOG_FILE=/tmp/upload/ss_log.txt", helper,
                         "ss_conf publish helper")
@@ -308,19 +337,42 @@ publish_download_alias(){
     old = '''    mv /tmp/files/shadowsocks.tar.gz.part /tmp/files/shadowsocks.tar.gz
     echo_date "插件打包完成，准备下载。"'''
     new = '''    mv /tmp/files/shadowsocks.tar.gz.part /tmp/files/shadowsocks.tar.gz
-    publish_download_alias /tmp/files/shadowsocks.tar.gz
+    publish_package_download
     echo_date "插件打包完成，准备下载。"'''
     text = replace_once(text, old, new, "ss_conf alias on package")
 
     old = '''    rm -f /tmp/files/shadowsocks.tar.gz
     echo_date "开始打包当前插件..."'''
-    new = '''    rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js
+    new = '''    rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js /tmp/files/shadowsocks.tar.gz.b64.js
     echo_date "开始打包当前插件..."'''
     text = replace_once(text, old, new, "ss_conf package stale cleanup")
 
     old = '''    case "$act" in 1) rm -f /tmp/files/ssconf_backup.sh ;; 12) rm -f /tmp/files/ssconf_backup_v2.json ;; 2) rm -f /tmp/files/shadowsocks.tar.gz ;; esac'''
-    new = '''    case "$act" in 1) rm -f /tmp/files/ssconf_backup.sh /tmp/files/ssconf_backup.sh.js ;; 12) rm -f /tmp/files/ssconf_backup_v2.json /tmp/files/ssconf_backup_v2.json.js ;; 2) rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js ;; esac'''
+    new = '''    case "$act" in 1) rm -f /tmp/files/ssconf_backup.sh /tmp/files/ssconf_backup.sh.js ;; 12) rm -f /tmp/files/ssconf_backup_v2.json /tmp/files/ssconf_backup_v2.json.js ;; 2) rm -f /tmp/files/shadowsocks.tar.gz /tmp/files/shadowsocks.tar.gz.js /tmp/files/shadowsocks.tar.gz.b64.js ;; esac'''
     text = replace_once(text, old, new, "ss_conf stale cleanup")
+
+    # The four log-download helpers wipe /tmp/files and recreate only the
+    # legacy `files` symlink; the working /Module_files route must be rebuilt
+    # too, otherwise log downloads break for the rest of the boot.
+    old_link = '''\trm -rf /tmp/files
+\trm -rf /koolshare/webs/files
+\tmkdir -p /tmp/files
+\tln -sf /tmp/files /koolshare/webs/files'''
+    new_link = old_link + '''
+\tln -sfn /tmp/files /koolshare/webs/Module_files'''
+    n = text.count(old_link)
+    if n != 4:
+        raise SystemExit("PATCH FAILED [log download symlink]: expected 4 matches, got %d" % n)
+    text = text.replace(old_link, new_link)
+
+    # Those logs are plain *.txt; give each one a *.js twin for the browser.
+    for call, alias in (
+        ('\tdownload_ssf\n', '\tpublish_download_alias /tmp/files/ssf_status.txt\n'),
+        ('\tdownload_ssc\n', '\tpublish_download_alias /tmp/files/ssc_status.txt\n'),
+        ('\tdownload_dig_log\n', '\tpublish_download_alias /tmp/files/dns_dig_result.txt\n'),
+        ('\tdownload_resv_log\n', '\tpublish_download_alias /tmp/files/$(dbus get ss_basic_logname).txt\n'),
+    ):
+        text = replace_once(text, call, call + alias, "ss_conf log alias %s" % call.strip())
     return text
 
 
@@ -428,6 +480,125 @@ def patch_dashboard_js(text):
     return text
 
 
+
+# arm380: rebuilt probe / download helpers for the /Module_files route.
+NEW_PROBE_JS = r'''
+function poll_route_file_ready(arg, meta, retry) {
+	var xhr = new XMLHttpRequest();
+	var url = meta.url;
+	var maxRetry = typeof meta.maxRetry == "number" ? meta.maxRetry : 20;
+	var retryDelay = typeof meta.retryDelay == "number" ? meta.retryDelay : 300;
+	var isB64 = /\.b64\.js(\?|$)/.test(url);
+	xhr.open("GET", url + (url.indexOf("?") === -1 ? "?" : "&") + "_probe=" + new Date().getTime(), true);
+	xhr.responseType = isB64 ? "text" : "blob";
+	xhr.onload = function() {
+		// arm380: /Module_* answers 200 with an EMPTY body when the file is
+		// missing, and the export is asynchronous (16 nodes take ~18 s).
+		// A bare status check would declare a nonexistent file ready.
+		var body = isB64 ? xhr.responseText : xhr.response;
+		var size = isB64 ? (body ? body.length : 0) : (body ? body.size : 0);
+		if (xhr.status >= 200 && xhr.status < 300 && size > 0) {
+			// Keep the probe payload: the package is 17 MB of base64, so
+			// downloading it a second time in download_blob_file is wasteful.
+			route_file_cache[url] = body;
+			flush_route_file_callbacks(arg, true);
+			return;
+		}
+		if (retry >= maxRetry) {
+			flush_route_file_callbacks(arg, false);
+			return;
+		}
+		setTimeout(function() {
+			poll_route_file_ready(arg, meta, retry + 1);
+		}, retryDelay);
+	};
+	xhr.onerror = function() {
+		if (retry >= maxRetry) {
+			flush_route_file_callbacks(arg, false);
+			return;
+		}
+		setTimeout(function() {
+			poll_route_file_ready(arg, meta, retry + 1);
+		}, retryDelay);
+	};
+	xhr.send();
+}
+'''
+
+NEW_DOWNLOAD_JS = r'''
+function save_route_blob(blob, fileName) {
+	var URLApi = window.URL || window.webkitURL;
+	if (!URLApi || !URLApi.createObjectURL || !blob) { return false; }
+	var blobUrl = URLApi.createObjectURL(blob);
+	var a = document.createElement("a");
+	a.href = blobUrl;
+	a.download = fileName;
+	document.body.appendChild(a);
+	a.click();
+	document.body.removeChild(a);
+	setTimeout(function() { URLApi.revokeObjectURL(blobUrl); }, 1000);
+	return true;
+}
+function decode_b64_blob(text) {
+	// arm380: a 13 MB binary cannot pass through httpd intact (it is cut at
+	// 43100 bytes). ss_conf.sh publishes it as single-line base64 instead;
+	// rebuild the .tar.gz bytes here.
+	var raw = atob(String(text).replace(/[\r\n\t ]/g, ""));
+	var arr = new Uint8Array(raw.length);
+	for (var i = 0; i < raw.length; i++) { arr[i] = raw.charCodeAt(i); }
+	return new Blob([arr], { type: "application/octet-stream" });
+}
+function download_blob_file(url, fileName, cb) {
+	var isB64 = /\.b64\.js(\?|$)/.test(url);
+	var cached = route_file_cache[url];
+	if (cached) {
+		try {
+			var cachedBlob = isB64 ? decode_b64_blob(cached) : cached;
+			if (save_route_blob(cachedBlob, fileName)) {
+				delete route_file_cache[url];
+				if (typeof cb === "function") { cb(true); }
+				return;
+			}
+		} catch (e) {}
+	}
+	var xhr = new XMLHttpRequest();
+	xhr.open("GET", url + (url.indexOf("?") === -1 ? "?" : "&") + "_ts=" + new Date().getTime(), true);
+	xhr.responseType = isB64 ? "text" : "blob";
+	xhr.onload = function() {
+		var body = isB64 ? xhr.responseText : xhr.response;
+		var size = isB64 ? (body ? body.length : 0) : (body ? body.size : 0);
+		if (xhr.status >= 200 && xhr.status < 300 && size > 0) {
+			try {
+				var blob = isB64 ? decode_b64_blob(body) : body;
+				if (save_route_blob(blob, fileName)) {
+					delete route_file_cache[url];
+					if (typeof cb === "function") { cb(true); }
+					return;
+				}
+			} catch (e) {}
+		}
+		// An iframe fallback would save the base64 TEXT under a .tar.gz name;
+		// report failure instead of handing the user a corrupt archive.
+		if (isB64) {
+			if (typeof cb === "function") { cb(false); }
+			return;
+		}
+		trigger_iframe_download(url);
+		if (typeof cb === "function") { cb(true); }
+	};
+	xhr.onerror = function() {
+		if (isB64) {
+			if (typeof cb === "function") { cb(false); }
+			return;
+		}
+		trigger_iframe_download(url);
+		if (typeof cb === "function") { cb(true); }
+	};
+	xhr.send();
+}
+'''
+
+
 def patch_asp(text, shim_ver):
     # 380 firmware has no /js/httpApi.js; page never references the object
     text = replace_once(text,
@@ -491,20 +662,59 @@ def patch_asp(text, shim_ver):
 
     # 380 httpd serves ONLY .js/.xml out of any directory; *.json / *.sh /
     # *.tar.gz are a 404 before authentication. ss_conf.sh republishes every
-    # export under a *.js hardlink, so the download URL carries that name while
-    # a[download] still saves the real filename.
+    # export under a *.js twin. The 386 "_root/files/..." route does not exist
+    # on 380: httpd maps /Module_<name> to /koolshare/webs/<name>, and
+    # install.sh links /koolshare/webs/Module_files to /tmp/files.
+    # The binary package is published as single-line base64 (.b64.js) because
+    # httpd truncates binary .js at 43100 bytes; the UI decodes it with atob.
     text = replace_once(text,
         '''url: "_root/files/shadowsocks.tar.gz"''',
-        '''url: "_root/files/shadowsocks.tar.gz.js"''',
-        "export url: package")
+        '''url: "/Module_files/shadowsocks.tar.gz.b64.js"''',
+        "export url: package (base64)")
     text = replace_once(text,
         '''url: "_root/files/ssconf_backup.sh"''',
-        '''url: "_root/files/ssconf_backup.sh.js"''',
+        '''url: "/Module_files/ssconf_backup.sh.js"''',
         "export url: legacy sh")
     text = replace_once(text,
         '''url: "_root/files/ssconf_backup_v2.json"''',
-        '''url: "_root/files/ssconf_backup_v2.json.js"''',
+        '''url: "/Module_files/ssconf_backup_v2.json.js"''',
         "export url: json")
+
+    # Log/status downloads use a plain <a href>; repoint them too.
+    for old_href, new_href in (
+        ('b.href = "_root/files/" + pkg_name + "_" + db_ss["ss_basic_version_local"] + ".tar.gz"',
+         'b.href = "/Module_files/" + pkg_name + "_" + db_ss["ss_basic_version_local"] + ".tar.gz.js"'),
+        ('b.href = "_root/files/ssf_status.txt"',
+         'b.href = "/Module_files/ssf_status.txt.js"'),
+        ('b.href = "_root/files/ssc_status.txt"',
+         'b.href = "/Module_files/ssc_status.txt.js"'),
+        ('b.href = "_root/files/"+ dns_log["ss_basic_logname"] +".txt"',
+         'b.href = "/Module_files/"+ dns_log["ss_basic_logname"] +".txt.js"'),
+        ('b.href = "_root/files/dns_dig_result.txt"',
+         'b.href = "/Module_files/dns_dig_result.txt.js"'),
+    ):
+        text = replace_once(text, old_href, new_href, "log href %s" % old_href[:46])
+
+    # The probe payload is cached so a 17 MB base64 package is fetched once.
+    text = replace_once(text,
+        'var prepared_route_files = {};',
+        'var prepared_route_files = {};\nvar route_file_cache = {};',
+        "route cache declaration")
+    text = replace_once(text,
+        '\tprepared_route_files[arg] = "pending";\n',
+        '\tprepared_route_files[arg] = "pending";\n\tdelete route_file_cache[meta.url];\n',
+        "route cache reset on new export")
+
+    # Replace the probe + blob-download helpers wholesale.
+    try:
+        i = text.index('function poll_route_file_ready(arg, meta, retry) {')
+        j = text.index('\nfunction prepare_route_file', i)
+        text = text[:i] + NEW_PROBE_JS + text[j + 1:]
+        i = text.index('function download_blob_file(url, fileName, cb) {')
+        j = text.index('\nfunction check_node_migration_notice', i)
+        text = text[:i] + NEW_DOWNLOAD_JS + text[j + 1:]
+    except ValueError as exc:
+        raise SystemExit("PATCH FAILED [download helpers]: %s" % exc)
     # cosmetic: the upstream hardcodes the reviewed model in two page titles.
     text = text.replace('"RT-AC3100 Xray Web Tool"', '"R6300V2 Xray Web Tool"')
     # 380 ships /res/Softerware_center.css under a different name; our package
