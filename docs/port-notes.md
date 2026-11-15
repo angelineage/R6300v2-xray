@@ -195,6 +195,62 @@ SPACE_AVAL=$(df | awk '$6 == "/jffs" {print $4; exit}')
 实测：杀掉主进程 → 采集进程 ~20 秒后自行退出 → 桥接下一次轮询发现快照过期 →
 自动拉起主进程与采集进程 → 快照恢复 1 秒新鲜。
 
+## 10. 只在路由模式运行；总开关关闭 = 全部停
+
+### 10.1 问题
+
+切到 AP 模式（`sw_mode=3`，LAN 由上级 DHCP 分配）后，插件页面仍能被打开。
+更要紧的是几条启动路径根本不看模式或开关：
+
+- `ssconfig.sh restart`（Web 端开关、`ss_reboot` 定时重启都走它）**不检查
+  `ss_basic_enable`**，一个已关闭的插件会被定时任务或界面调用重新拉起来；
+- 380 移植新增的 `xwt_dash_sampler.sh` / `xwt_tmp_mirror.sh` 由 `nat-start`
+  **无条件**拉起，而 `disable_ss()` 是上游代码，完全不认识这两个进程；
+- 桥接 `fss_api_bridge.sh` 与 `ss_dashboard.sh` 有「快照过期就重新拉起采样器」
+  的自愈逻辑，停掉也会被复活。
+
+### 10.2 统一守卫
+
+新增 `scripts/xwt_run_guard.sh` 作为唯一判定源：
+
+- `xwt_router_mode()`：`sw_mode=1` 才是路由模式；固件不提供该键时用
+  `lan_proto != dhcp` 兜底（AP/桥接由上级 DHCP 分配 LAN 地址）；
+- `xwt_switch_on()`：`ss_basic_enable=1`；`xwt_may_run()`：两者同时成立；
+- `xwt_start_daemons()` / `xwt_stop_daemons()`：管两个 380 常驻守护；
+- `xwt_publish_mode()`：把 `router` / `nonrouter` 写进 dbus 供诊断。
+
+所有入口都过守卫：`ssconfig.sh` 的 start/restart/stop/start_nat/
+restart_chinadns_ng、`nat-start`、install.sh 安装收尾、采样器主循环（30 s
+一次）、tmp mirror 主循环（10 s 一次）、桥接与 `ss_dashboard.sh` 的自愈拉起。
+非路由模式下 `restart` 会先执行一遍轻量清理（停 ws / 代理进程 / 状态守护、
+刷插件专用 iptables 与 cron、`xwt_stop_daemons`）再 `exit 0`。
+`flush_iptables` 只删带 `SHADOWSOCKS|3333` 标记的规则，不碰固件自己的链。
+
+### 10.3 界面拒绝打开
+
+ASP 里的 `<% nvram_get("sw_mode"); %>` 由 httpd 在发页面前展开，实测得到
+`var xwt_sw_mode = '3';`。`init()` 开头判断非 `1` 就显示全屏遮罩并 `return`：
+不加载数据、不启动状态轮询，控件也不会绑定事件。
+
+### 10.4 实测（R6300V2，AP 模式 192.168.10.146）
+
+- 判定：sw_mode 1→放行，2/3/4→拒绝；sw_mode=1 且开关 1→放行，开关 0→拒绝。
+- `ssconfig.sh restart` 被模式守卫拦下：进程 0→0、cron 0→0、
+  iptables nat 规则 11→11（无误伤），syslog 出现「非路由模式，Xray Web Tool 已停用。」
+- 模拟路由模式 + 开关 0：被开关守卫拦下，syslog「总开关关闭，跳过启动并停止后台守护。」
+- `xwt_stop_daemons` 能杀掉名字匹配的守护进程；设备 7 个文件与构建产物 MD5 全一致；
+  `sh -n` 与 ASP 内联 JS 检查通过。
+
+### 10.5 取舍
+
+开关关闭时连 `xwt_tmp_mirror.sh` 也停（对应「关闭全部相关功能」）。
+面板仍可打开、配置仍可导出：RPC 回传由桥接直接写 `/res/xwt_tmp/*.js`，
+导出走 `/Module_files/`，都不依赖这个镜像；但状态页 `ss_status_front.txt.js`
+的实时刷新会停。若希望关掉代理后仍保留实时日志镜像，把 `TMP_MIRROR` 的守卫
+从 `xwt_may_run` 换回 `xwt_router_mode` 即可。
+
+---
+
 ## 7. 没有做的事
 
 - **`/koolshare/bin` 里 hysteria 4.5 MB、anytls 1.7 MB、smartdns 1.3 MB、obfs-local 0.36 MB**

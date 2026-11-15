@@ -192,6 +192,14 @@ esac''', "device whitelist")
     text = replace_once(text,
         '''\tcp -rf /tmp/shadowsocks/webs/* /koolshare/webs/''',
         '''\tcp -rf /tmp/shadowsocks/webs/* /koolshare/webs/
+\t# XWT_ARM380_RUN_GUARD: install-time daemon starts below honour the
+\t# router mode and master switch instead of always running.
+\txwt_may_run() { return 0; }
+\txwt_router_mode() { return 0; }
+\txwt_start_daemons() { :; }
+\txwt_stop_daemons() { :; }
+\txwt_publish_mode() { :; }
+\t[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
 \t# arm380: the 386 "_root/files/..." route does not exist here. httpd maps
 \t# /Module_<name> to /koolshare/webs/<name>, so expose /tmp/files under that
 \t# name; every export / log download is fetched as /Module_files/<file>.js.
@@ -209,6 +217,21 @@ mkdir -p /tmp/upload /koolshare/res/xwt_tmp
 # and survives the wipe; recreate both ends on every boot.
 mkdir -p /tmp/files
 ln -sfn /tmp/files /koolshare/webs/Module_files
+# XWT_ARM380_RUN_GUARD: WAN/NAT/DNS belong to the upstream router in AP,
+# repeater and media-bridge modes. Publish the mode for diagnostics, then
+# stop before any daemon or proxy is started.
+xwt_may_run() { return 0; }
+xwt_router_mode() { return 0; }
+xwt_start_daemons() { :; }
+xwt_stop_daemons() { :; }
+xwt_publish_mode() { :; }
+[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
+xwt_publish_mode
+if ! xwt_router_mode; then
+	logger "[软件中心]: 非路由模式，Xray Web Tool 不启动。"
+	xwt_stop_daemons
+	exit 0
+fi
 # XWT_ARM380_TMPFS: /res is JFFS. Rewriting the status/dashboard mirrors there
 # every second kept the flash in D-state (load 8+ on this 2-core box), so the
 # volatile files live on tmpfs. Falls back to plain JFFS if mount is refused.
@@ -217,7 +240,7 @@ if ! mount | grep -q 'res/xwt_tmp type tmpfs'; then
 fi
 # XWT_ARM380_TMP_MIRROR: 380 httpd has no /_temp/ route; expose the upload
 # cache as /res/xwt_tmp/ so the UI transport can rewrite those reads.
-if ! ps w | grep -q '[x]wt_tmp_mirror.sh'; then
+if xwt_may_run && ! ps w | grep -q '[x]wt_tmp_mirror.sh'; then
 \tif [ -x /usr/sbin/start-stop-daemon ]; then
 \t\tstart-stop-daemon -S -b -q -m -p /var/run/xwt_tmp_mirror.pid -x /bin/sh -- /koolshare/scripts/xwt_tmp_mirror.sh
 \telse
@@ -226,7 +249,7 @@ if ! ps w | grep -q '[x]wt_tmp_mirror.sh'; then
 fi
 # XWT_ARM380_DASH: one resident 1 Hz sampler owns the status snapshot. The
 # poll path must not fork jq/curl per request -- that saturated mtdblock3.
-if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
+if xwt_may_run && ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 \tif [ -x /usr/sbin/start-stop-daemon ]; then
 \t\tstart-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid -x /bin/sh -- /koolshare/scripts/xwt_dash_sampler.sh
 \telse
@@ -234,7 +257,7 @@ if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 \tfi
 fi
 # XWT_ARM380_BOOT_GUARD: one start per boot, never re-enter.
-if [ ! -f /tmp/xwt_boot_started ] && ! ps w | grep -q '[s]sconfig.sh'; then
+if xwt_may_run && [ ! -f /tmp/xwt_boot_started ] && ! ps w | grep -q '[s]sconfig.sh'; then
 \t: > /tmp/xwt_boot_started
 \tsh /koolshare/ss/ssconfig.sh start
 fi
@@ -244,9 +267,8 @@ BOOTEOF
 \tif ! mount | grep -q 'res/xwt_tmp type tmpfs'; then
 \t\tmount -t tmpfs -o size=4m tmpfs /koolshare/res/xwt_tmp 2>/dev/null
 \tfi
-\tps w | grep -q '[x]wt_tmp_mirror.sh' || sh /koolshare/scripts/xwt_tmp_mirror.sh >/dev/null 2>&1 &
 \tchmod 755 /koolshare/scripts/xwt_*.sh >/dev/null 2>&1
-\tps w | grep -q '[x]wt_dash_sampler.sh$' || sh /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1 &
+\txwt_start_daemons
 \techo_date "arm380: 已写入带防重入的开机自启钩子与 /_temp 镜像。"''',
         "boot hook")
     # arm380: the 1 Hz dashboard sampler is a standalone daemon and an install
@@ -254,10 +276,14 @@ BOOTEOF
     # notice a stale snapshot can take 30 s.
     text = replace_once(text,
         '''	# finish''',
-        '''	start-stop-daemon -K -q -p /var/run/xwt_dash_sampler.pid >/dev/null 2>&1
-	for _xwt_p in $(ps w | grep '[x]wt_dash_sampler.sh' | awk '{print $1}'); do kill $_xwt_p 2>/dev/null; done
-	rm -f /tmp/xwt_dash.lock
-	start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid -x /bin/sh -- /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1
+        '''	if xwt_may_run; then
+		start-stop-daemon -K -q -p /var/run/xwt_dash_sampler.pid >/dev/null 2>&1
+		for _xwt_p in $(ps w | grep '[x]wt_dash_sampler.sh' | awk '{print $1}'); do kill $_xwt_p 2>/dev/null; done
+		rm -f /tmp/xwt_dash.lock
+		start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid -x /bin/sh -- /koolshare/scripts/xwt_dash_sampler.sh >/dev/null 2>&1
+	else
+		xwt_stop_daemons
+	fi
 
 	# finish''',
         "restart dashboard sampler")
@@ -279,6 +305,118 @@ ICON_CSS = '''<style type="text/css">
 </style>
 '''
 
+
+
+def patch_ssconfig(text):
+    # arm380: the proxy needs WAN/NAT/DNS ownership, which only router mode
+    # provides. `ssconfig.sh restart` is called by the web UI AND by the
+    # ss_reboot cron; neither checked the master switch, so a disabled plugin
+    # came back on its own. nat-start also started the arm380 daemons without
+    # asking. One guard in front of the ACTION dispatch closes every path.
+    guard = '''
+# =========================================================================
+# XWT_ARM380_RUN_GUARD
+# =========================================================================
+xwt_may_run() { return 0; }
+xwt_router_mode() { return 0; }
+xwt_start_daemons() { :; }
+xwt_stop_daemons() { :; }
+xwt_publish_mode() { :; }
+[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
+if [ -f /koolshare/scripts/xwt_run_guard.sh ]; then
+\txwt_publish_mode
+\tif ! xwt_router_mode; then
+\t\tcase "$ACTION" in
+\t\t\tstop|flush_nat) ;;
+\t\t\t*)
+\t\t\t\tlogger "[软件中心]: 非路由模式，Xray Web Tool 已停用。"
+\t\t\t\tstop_ws
+\t\t\t\tkill_process
+\t\t\t\tstop_status
+\t\t\t\tflush_iptables
+\t\t\t\tflush_ipset
+\t\t\t\tkill_cron_job
+\t\t\t\tremove_ss_reboot_job
+\t\t\t\tremove_ss_trigger_job
+\t\t\t\txwt_stop_daemons
+\t\t\t\tdbus set ss_basic_status="0" >/dev/null 2>&1
+\t\t\t\texit 0
+\t\t\t\t;;
+\t\t\tesac
+\tfi
+fi
+
+'''
+    text = replace_once(text, "case $ACTION in\n", guard + "case $ACTION in\n",
+                        "ssconfig guard")
+
+    text = replace_once(text,
+        '''\t\tapply_ss 2>&1 | tee -a "$LOG_FILE" | tee -a "/tmp/upload/ss_wan_log.txt"
+\t\techo XU6J03M6 | tee -a "$LOG_FILE"''',
+        '''\t\tapply_ss 2>&1 | tee -a "$LOG_FILE" | tee -a "/tmp/upload/ss_wan_log.txt"
+\t\txwt_start_daemons
+\t\techo XU6J03M6 | tee -a "$LOG_FILE"''',
+        "ssconfig start launches daemons")
+
+    text = replace_once(text,
+        '''\telse
+\t\tlogger "[软件中心]: Xray Web Tool 已停用。"
+\tfi
+\tunset_lock
+\t;;
+stop)''',
+        '''\telse
+\t\tlogger "[软件中心]: Xray Web Tool 已停用。"
+\t\txwt_stop_daemons
+\tfi
+\tunset_lock
+\t;;
+stop)''',
+        "ssconfig start disabled stops daemons")
+
+    text = replace_once(text,
+        '''stop)
+\tset_lock
+\tdisable_ss
+\techo_date''',
+        '''stop)
+\tset_lock
+\tdisable_ss
+\txwt_stop_daemons
+\techo_date''',
+        "ssconfig stop stops daemons")
+
+    text = replace_once(text,
+        '''restart)
+\t# start/restart by web or user
+\tset_lock
+\tstart_ws
+\tapply_ss
+\techo_date''',
+        '''restart)
+\t# start/restart by web or user
+\tset_lock
+\tif [ "$ss_basic_enable" != "1" ]; then
+\t\tlogger "[软件中心]: 总开关关闭，跳过启动并停止后台守护。"
+\t\txwt_stop_daemons
+\t\tunset_lock
+\t\texit 0
+\tfi
+\tstart_ws
+\tapply_ss
+\txwt_start_daemons
+\techo_date''',
+        "ssconfig restart honours master switch")
+
+    text = replace_once(text,
+        '''restart_chinadns_ng)
+\tstart_chinadns_ng
+\t;;''',
+        '''restart_chinadns_ng)
+\txwt_may_run && start_chinadns_ng
+\t;;''',
+        "ssconfig chinadns restart guard")
+    return text
 
 
 def patch_ss_conf(text):
@@ -715,6 +853,40 @@ def patch_asp(text, shim_ver):
         text = text[:i] + NEW_DOWNLOAD_JS + text[j + 1:]
     except ValueError as exc:
         raise SystemExit("PATCH FAILED [download helpers]: %s" % exc)
+    # XWT_ARM380_RUN_GUARD: httpd expands <% nvram_get(...) %> before serving
+    # the ASP, so the page knows the operation mode without an extra RPC.
+    # sw_mode: 1=Router, 2=Repeater, 3=Access Point, 4=Media Bridge.
+    text = replace_once(text,
+        '''var lan_ipaddr = '<% nvram_get("lan_ipaddr"); %>';''',
+        '''var lan_ipaddr = '<% nvram_get("lan_ipaddr"); %>';
+var xwt_sw_mode = '<% nvram_get("sw_mode"); %>';''',
+        "inject sw_mode")
+
+    text = replace_once(text,
+        '''function init() {
+	show_menu(menu_hook);''',
+        '''function xwt_show_mode_block() {
+	var names = { "2": "中继模式", "3": "AP 模式", "4": "媒体桥接模式" };
+	var label = names[xwt_sw_mode] || ("非路由模式 (sw_mode=" + xwt_sw_mode + ")");
+	var box = document.createElement("div");
+	box.style.cssText = "position:fixed;left:0;top:0;right:0;bottom:0;z-index:99999;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;";
+	box.innerHTML = '<div style="max-width:560px;padding:26px 30px;background:#fff;color:#222;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.5);font:14px/1.9 sans-serif;">'
+		+ '<div style="font-size:18px;font-weight:600;margin-bottom:12px;color:#c0392b;">Xray Web Tool 已停止运行</div>'
+		+ '<div>当前设备工作在 <b>' + label + '</b>，不是路由模式。</div>'
+		+ '<div>本插件需要接管 WAN、NAT 与 DNS，仅支持<b>路由模式</b>；为避免破坏网络，所有代理进程、定时任务与后台采样均已停止。</div>'
+		+ '<div style="margin-top:12px;color:#666;">请在「系统管理 → 操作模式」切回路由模式后重新打开本页。</div>'
+		+ '<div style="margin-top:20px;"><a href="javascript:history.back();" style="display:inline-block;padding:7px 18px;background:#2d7d46;color:#fff;border-radius:4px;text-decoration:none;">返回软件中心</a></div>'
+		+ '</div>';
+	document.body.appendChild(box);
+}
+function init() {
+	show_menu(menu_hook);
+	if (xwt_sw_mode && xwt_sw_mode !== "1") {
+		xwt_show_mode_block();
+		return;
+	}''',
+        "ASP mode block")
+
     # cosmetic: the upstream hardcodes the reviewed model in two page titles.
     text = text.replace('"RT-AC3100 Xray Web Tool"', '"R6300V2 Xray Web Tool"')
     # 380 ships /res/Softerware_center.css under a different name; our package
@@ -1139,6 +1311,81 @@ http_response() { printf '%s' "$1" > /tmp/upload/.xwt_response 2>/dev/null; }
 # the files into /res/xwt_tmp/ and let the JS transport rewrite the URL.
 # NOTE: this httpd only serves whitelisted extensions (.js/.xml/.css/.png...);
 # .txt and .json answer 404, so every mirror file is stored as "<name>.js".
+RUN_GUARD = r'''
+#!/bin/sh
+# xwt_run_guard.sh -- arm380: one authority for "may the proxy run?".
+# 380/386 nvram sw_mode: 1=Router, 2=Repeater, 3=Access Point, 4=Media Bridge.
+# Only router mode owns WAN/NAT/DNS, so every start path passes through here.
+XWT_KSROOT=/koolshare
+
+xwt_router_mode(){
+  local sw lp
+  sw="$(nvram get sw_mode 2>/dev/null)"
+  if [ -n "$sw" ]; then
+    [ "$sw" = "1" ] && return 0
+    return 1
+  fi
+  # Builds without sw_mode: AP/bridge gets its LAN address from upstream
+  # DHCP, router mode uses a static LAN address.
+  lp="$(nvram get lan_proto 2>/dev/null)"
+  [ "$lp" != "dhcp" ]
+}
+
+xwt_switch_on(){
+  [ "$(dbus get ss_basic_enable 2>/dev/null)" = "1" ]
+}
+
+xwt_may_run(){
+  xwt_router_mode || return 1
+  xwt_switch_on || return 1
+  return 0
+}
+
+xwt_publish_mode(){
+  if xwt_router_mode; then
+    dbus set ss_basic_run_mode="router" >/dev/null 2>&1
+  else
+    dbus set ss_basic_run_mode="nonrouter" >/dev/null 2>&1
+    dbus set ss_basic_status="0" >/dev/null 2>&1
+  fi
+}
+
+# disable_ss() predates the arm380 port and knows nothing about these two
+# resident daemons; without this they keep sampling a stopped proxy forever.
+xwt_stop_daemons(){
+  local p
+  for p in $(ps w 2>/dev/null | grep -E '[x]wt_dash_sampler\.sh|[x]wt_tmp_mirror\.sh' | awk '{print $1}'); do
+    kill "$p" 2>/dev/null
+  done
+  rm -f /var/run/xwt_dash_sampler.pid /var/run/xwt_tmp_mirror.pid
+  rm -f /tmp/xwt_dash.lock /tmp/xwt_dash_traffic.lock
+}
+
+# Called when the master switch turns ON. UI plumbing (tmp mirror) also needs
+# to come back if the router was booted while the proxy was disabled.
+xwt_start_daemons(){
+  xwt_may_run || return 0
+  mkdir -p "$XWT_KSROOT/res/xwt_tmp" 2>/dev/null
+  if ! ps w | grep -q '[x]wt_tmp_mirror.sh'; then
+    if [ -x /usr/sbin/start-stop-daemon ]; then
+      start-stop-daemon -S -b -q -m -p /var/run/xwt_tmp_mirror.pid \
+        -x /bin/sh -- "$XWT_KSROOT/scripts/xwt_tmp_mirror.sh" >/dev/null 2>&1
+    else
+      /bin/sh "$XWT_KSROOT/scripts/xwt_tmp_mirror.sh" >/dev/null 2>&1 &
+    fi
+  fi
+  if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
+    if [ -x /usr/sbin/start-stop-daemon ]; then
+      start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid \
+        -x /bin/sh -- "$XWT_KSROOT/scripts/xwt_dash_sampler.sh" >/dev/null 2>&1
+    else
+      /bin/sh "$XWT_KSROOT/scripts/xwt_dash_sampler.sh" >/dev/null 2>&1 &
+    fi
+  fi
+}
+'''
+
+
 TMP_MIRROR = r'''#!/bin/sh
 # xwt_tmp_mirror.sh -- mirror /tmp/upload/* into /res/xwt_tmp/ for arm380.
 # /res lives on JFFS, so xwt_tmp is mounted as tmpfs (see nat-start): rewriting
@@ -1146,7 +1393,13 @@ TMP_MIRROR = r'''#!/bin/sh
 # "test -nt" keeps the loop fork-free; cp only runs when a source really changed.
 DST=/koolshare/res/xwt_tmp
 mkdir -p "$DST" 2>/dev/null
+# XWT_ARM380_RUN_GUARD: the master switch turns off EVERYTHING the plugin
+# runs, this mirror included. Bridge writes its own *.js replies directly,
+# so the panel stays usable without it.
+xwt_may_run() { return 0; }
+[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
 while : ; do
+	xwt_may_run || exit 0
 	for f in /tmp/upload/*.txt /tmp/upload/*.json; do
 		[ -f "$f" ] || continue
 		b=${f##*/}
@@ -1162,6 +1415,9 @@ done
 '''
 
 SAMPLER = r'''#!/bin/sh
+# XWT_ARM380_RUN_GUARD: do not keep sampling a proxy that must be off.
+xwt_may_run() { return 0; }
+[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
 # xwt_dash_sampler.sh -- 1 Hz dashboard sampler for Merlin 380 / R6300V2.
 #
 # arm380 notes, all measured on the device:
@@ -1471,6 +1727,10 @@ while :; do
 	# Re-arm the collector every ~30 s if it stopped publishing.
 	_meta_check=$(( (_meta_check + 1) % 30 ))
 	[ "$_meta_check" = 0 ] && start_traffic_daemon
+	# ~30 s cadence: quitting here costs nothing and covers a live mode
+	# switch without a reboot. The launchers are guarded too, so nothing
+	# respawns us until router mode + master switch are both back.
+	[ "$_meta_check" = 0 ] && { xwt_may_run || exit 0; }
 
 	# Publish once per tick. Write-then-rename keeps readers from catching a
 	# truncated document.
@@ -1496,6 +1756,9 @@ done
 
 
 DASH_SHIM = r'''#!/bin/sh
+# XWT_ARM380_RUN_GUARD: never cold-start the sampler when it may not run.
+xwt_may_run() { return 0; }
+[ -f /koolshare/scripts/xwt_run_guard.sh ] && . /koolshare/scripts/xwt_run_guard.sh
 # ss_dashboard.sh -- arm380 thin shim over the resident 1 Hz sampler.
 #
 # The original script rebuilt the whole document on every UI poll: pidof,
@@ -1539,7 +1802,7 @@ esac
 if [ "$fresh" = 0 ]; then
 	# Cold cache: one synchronous sample, then make sure the daemon survives.
 	snap=$(sh "$KS/scripts/xwt_dash_sampler.sh" --once 2>/dev/null)
-	if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
+	if xwt_may_run && ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 		sh "$KS/scripts/xwt_dash_sampler.sh" >/dev/null 2>&1 &
 	fi
 fi
@@ -1562,6 +1825,12 @@ BRIDGE = r'''#!/bin/sh
 # Invoked by httpd as SystemCmd=fss_api_bridge.sh after /applydb.cgi writes the
 # RPC payload into dbus. Never takes arguments on the command line.
 KSROOT=/koolshare
+# XWT_ARM380_RUN_GUARD: stale-snapshot self-healing must not revive a
+# stopped proxy. Default allows, the real guard overrides when present.
+xwt_may_run() { return 0; }
+xwt_publish_mode() { :; }
+[ -f "$KSROOT/scripts/xwt_run_guard.sh" ] && . "$KSROOT/scripts/xwt_run_guard.sh"
+xwt_publish_mode
 [ -f "$KSROOT/scripts/base.sh" ] && . "$KSROOT/scripts/base.sh"
 # xwt_tmp is a tmpfs mount point (empty after every boot)
 mkdir -p "$KSROOT/res/xwt_tmp" 2>/dev/null
@@ -1673,7 +1942,7 @@ if [ "$METHOD" = "ss_dashboard.sh" ]; then
 	read -r _nowf _idle < /proc/uptime
 	_dash_age=$(( ${_nowf%%.*} - _dash_up ))
 	if [ "$_dash_age" -lt 0 ] || [ "$_dash_age" -gt 5 ]; then
-		if ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
+		if xwt_may_run && ! ps w | grep -q '[x]wt_dash_sampler.sh$'; then
 			if [ -x /usr/sbin/start-stop-daemon ]; then
 				start-stop-daemon -S -b -q -m -p /var/run/xwt_dash_sampler.pid \
 					-x /bin/sh -- "$KSROOT/scripts/xwt_dash_sampler.sh" 2>/dev/null
@@ -2020,6 +2289,7 @@ def main():
     write_text_lf(SRC / "scripts" / "xwt_dash_sampler.sh", SAMPLER)
     write_text_lf(SRC / "scripts" / "ss_dashboard.sh", DASH_SHIM)
     write_text_lf(SRC / "scripts" / "xwt_backup_upload.sh", BACKUP_UPLOAD)
+    write_text_lf(SRC / "scripts" / "xwt_run_guard.sh", RUN_GUARD)
 
     # --- ss_conf.sh: export / clear / package -----------------------------
     # Two 380 facts break it: (a) the shims file is sourced twice and the
@@ -2027,6 +2297,10 @@ def main():
     # so each export needs a *.js twin to be downloadable.
     p = SRC / "scripts" / "ss_conf.sh"
     write_text_lf(p, patch_ss_conf(p.read_text("utf-8")))
+
+    # --- ssconfig.sh: router-only + master-switch guard ---
+    p = SRC / "ss" / "ssconfig.sh"
+    write_text_lf(p, patch_ssconfig(p.read_text("utf-8")))
 
     # --- model strings: online update must NOT pull the upstream 386 package
     #     onto this port (its target.model is RT-AC3100, so requiring R6300V2
