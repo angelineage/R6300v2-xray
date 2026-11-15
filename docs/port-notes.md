@@ -251,6 +251,52 @@ ASP 里的 `<% nvram_get("sw_mode"); %>` 由 httpd 在发页面前展开，实�
 
 ---
 
+## 11. v0.1.16 发布（2026-11-15）
+
+包含 0.1.15 之后三批已验证修复：`2c9ac8e` 附加功能与订阅、`911644d` 下载链路、
+`1d929de` 运行模式守卫。构建用 `XWT_VERSION=0.1.16 python tools/port.py`，
+产物 13,038,354 字节 / 179 文件，SHA-256
+`f9289680beda05ff5427d40eb534292a97c035d8eb2a627f1fd744c835ea2af2`。
+
+### 发布前完整重建 + 设备重装验证（AP 模式 192.168.10.146）
+
+- 备份用 `dbus listall`（**不是** `dbus export`）：该固件的 `dbus export <key>`
+  实测返回空、无参数调用还会段错误；`listall` 全量 235 行可用于 `dbus import`。
+- 安装退出码 0，日志 `Xray Web Tool v0.1.16 安装成功`；`compat_revision`、
+  `fss_ac3100_version`、`softcenter_module_shadowsocks_version` 均为 0.1.16。
+- **dbus 全量差分**：安装前后键集合完全相同，7 个节点值、order、current、
+  next_id、schema 全无损，仅两个版本字段由 0.1.15 → 0.1.16。
+- 守卫：xray / chinadns / xwt / websocketd 进程全 0、cron 0、iptables nat 11 条未变；
+  页面注入 `var xwt_sw_mode = '3';`，遮罩函数存在，`_root/files` 零残留。
+- 下载闭环：导出 JSON 43,507 B（HTTP MD5 = 源文件 MD5）、打包 13,061,713 B →
+  base64 17,415,620 B → 完整下载 1.36 s → 解码 MD5 一致、`tar tzf` 可读、
+  日志 `.txt.js` MD5 一致。
+- 包内 51 个 `.sh` 的 `bash -n`、设备 ash `sh -n` 7 个脚本、ASP 内联 JS
+  `node --check` 全通过。
+
+### 两个测试侧的环境坑（不是产品缺陷）
+
+1. **343 字节响应 = 未登录跳转页**（`<script>top.location.href='/Main_Login.asp';`）。
+   一次登录偶发失败会让后续所有 `/Module_files/` 下载都变成 343 B；重新登录后
+   同一 URL 立刻返回正确内容。判定下载成功必须校验 body 大小。
+2. **设备时钟停在 2015-08-01** ⇒ 任何 CA 都报 `certificate is not yet valid`，
+   `curl -k` 却 200。临时 `date -s` 校正后 GitHub API 200、
+   `ss_update.sh check` 经 `http_response` 回传 `v0.1.16`。测完已恢复原时钟。
+   另外 `ss_conf.sh 6`（日志下载）会清空 `/tmp/files`，所以导出与日志的校验要分开做。
+
+### 端到端
+
+Release `v0.1.16`（id `445940723`）三个附件均 201；从
+`releases/download/v0.1.16/` 拉回的 `SHA256SUMS.txt`、`build-manifest.json` 与
+本地逐字节一致，安装包 SHA-256 三方一致。首次拉包曾遇到 CDN 偶发截断
+（12,378,496 B），重下即完整 —— 自更新会用 `SHA256SUMS.txt` 拒绝残包。
+
+### 本版未在 AP 模式重测
+
+代理出网、1 Hz 采样、规则更新全链路、订阅同步、清空 / 恢复配置。这些在
+0.1.15 及之前的路由模式已实测通过，本版未改动相关代码；AP 模式下插件按设计
+不运行，无法产生代理流量。
+
 ## 7. 没有做的事
 
 - **`/koolshare/bin` 里 hysteria 4.5 MB、anytls 1.7 MB、smartdns 1.3 MB、obfs-local 0.36 MB**

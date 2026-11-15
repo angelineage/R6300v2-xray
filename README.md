@@ -9,9 +9,9 @@
 
 | 项目 | 值 |
 |---|---|
-| 版本 | 0.1.15 |
-| 安装包 | `shadowsocks_arm380_r6300v2_0.1.15.tar.gz`（177 文件 / 13.0 MB） |
-| SHA-256 | `8430c7f1a47d96aa3bee6f198bdaa78ea26a1c9d55060a4b05641b5cdcf76fda` |
+| 版本 | 0.1.16 |
+| 安装包 | `shadowsocks_arm380_r6300v2_0.1.16.tar.gz`（179 文件 / 13,038,354 字节） |
+| SHA-256 | `f9289680beda05ff5427d40eb534292a97c035d8eb2a627f1fd744c835ea2af2` |
 | 实测机型 | R6300V2（380.70_X7.9.1）；其他 arm380 机型未验证 |
 | 许可 | GPL-3.0（与上游一致，二进制原样取自上游发行） |
 
@@ -27,7 +27,8 @@
 导出/打包/日志的浏览器下载链路已在 LAN 侧按真实登录会话完整验证。
 订阅模块用真实订阅地址验证：保存订阅配置 → 同步 → 解析出 24 个 vless 节点 → 写入 dbus。
 
-> 这一批修复已进入源码（`tools/port.py`），**尚未发布新版本**；版本号与 Release 等你确认后再动。
+> 以上修复已全部进入 **v0.1.16** Release（tag `v0.1.16`）。0.1.15 不含附加功能、下载链路与模式守卫修复，重装旧版会回退。
+> v0.1.16 在 AP 模式设备上完整重装验证：dbus 235 个键仅两个版本字段变化，节点无损；导出 / 打包 / 日志下载均通过 HTTP 闭环校验。
 
 ## 安装
 
@@ -46,14 +47,14 @@ sh scripts/backup-before-install.sh
 
 ### 2. 安装
 
-方式一：软件中心 → 离线安装 → 上传 `shadowsocks_arm380_r6300v2_0.1.8.tar.gz`。
+方式一：软件中心 → 离线安装 → 上传 `shadowsocks_arm380_r6300v2_0.1.16.tar.gz`。
 
 方式二（SSH）：
 
 ```sh
-scp shadowsocks_arm380_r6300v2_0.1.8.tar.gz admin@192.168.50.1:/tmp/
+scp shadowsocks_arm380_r6300v2_0.1.16.tar.gz admin@192.168.50.1:/tmp/
 ssh admin@192.168.50.1
-dbus set soft_name="shadowsocks_arm380_r6300v2_0.1.8.tar.gz"
+dbus set soft_name="shadowsocks_arm380_r6300v2_0.1.16.tar.gz"
 sh /koolshare/scripts/ks_tar_intall.sh
 ```
 
@@ -141,7 +142,8 @@ XWT_UPSTREAM=/path/to/xray-web-tool python3 tools/port.py
 6. 自更新要下 13 MB 包，本机直连 GitHub 常解析超时，日志里会先出现一条 `curl: (6)` 再自动走代理续传，属正常回退；全程约 2 分钟。
 7. 380 的 httpd 下载有三层坑：只放行 `.js` / `.xml`（用 `.js` 硬链接绕过）、没有 386 的 `_root/files/` 路由（改用 `/Module_files/`，安装与开机时建软链）、二进制大文件会在 43100 字节处被截断（打包插件改发 base64 单行文本，前端 `atob` 还原）。用户看到的文件名仍是 `.json` / `.tar.gz`。
 8. 「恢复配置」不走 `/_upload`（380 没有这个路由），改为 base64 分片经 `/_api/` 上传，单片 3000 字符。
-9. **仅支持路由模式**：`sw_mode` 为 2/3/4（中继 / AP / 媒体桥接）时所有启动入口被守卫拦下，页面显示「已停止运行」遮罩；总开关关闭会停掉代理、iptables 规则、定时任务，以及 380 移植新增的采样器与 tmp 镜像守护。面板仍可打开做配置与导出，但状态页的实时快照不再刷新。
+9. **设备无 RTC**：开机时钟可能停在 2015 年，TLS 证书会被判 `not yet valid`，自更新与规则更新随即失败。先同步时钟（`curl -k` 可 200 而默认校验失败即此症状）；实测校正后 `api.github.com` 返回 200、`ss_update.sh check` 回传 `v0.1.16`。
+10. **仅支持路由模式**：`sw_mode` 为 2/3/4（中继 / AP / 媒体桥接）时所有启动入口被守卫拦下，页面显示「已停止运行」遮罩；总开关关闭会停掉代理、iptables 规则、定时任务，以及 380 移植新增的采样器与 tmp 镜像守护。面板仍可打开做配置与导出，但状态页的实时快照不再刷新。
 
 ## 目录结构
 
